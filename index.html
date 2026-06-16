@@ -651,8 +651,9 @@ const followPos = new THREE.Vector3(), followVel = new THREE.Vector3();
 const smoothFwd = new THREE.Vector3(0, 0, -1), UP = new THREE.Vector3(0, 1, 0);
 const deathCamPos = new THREE.Vector3(), deathLook = new THREE.Vector3();
 let followHealth = 0, followReadTime = 0, followPending = false;
-let lookMode = false, dying = false, deathTime = 0;
-let downX = 0, downY = 0, downT = 0;
+let lookActive = false, dying = false, deathTime = 0;
+let dragging = false, downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0;
+let lookYaw = 0, lookPitch = 0.2, lookDist = 7;
 
 // --- Death explosion: a CPU particle burst (additive, so bloom makes it pop) -
 const EXP_N = 700;
@@ -718,20 +719,29 @@ function randomShip() {
   runPickResult();
 }
 
-function setLookMode(on) {
+// Free-look = a custom orbit around the ship (no OrbitControls handoff, so the
+// very first drag works). enterLook() seeds yaw/pitch/dist from the current
+// cockpit camera so there's no jump.
+function enterLook() {
   if (followIndex < 0) return;
-  lookMode = on;
-  controls.enabled = on;
-  controls.autoRotate = false;
-  $('ck_look').classList.toggle('on', on);
-  $('crosshair').style.display = on ? 'none' : 'block';
-  if (on) { controls.minDistance = 1.2; controls.maxDistance = 400; }
+  const off = camera.position.clone().sub(estShipPos());
+  lookDist = THREE.MathUtils.clamp(off.length(), 2.4, 120);
+  lookPitch = Math.asin(THREE.MathUtils.clamp(off.y / Math.max(lookDist, 1e-3), -1, 1));
+  lookYaw = Math.atan2(off.x, off.z);
+  lookActive = true;
+  $('ck_look').classList.add('on');
+  $('crosshair').style.display = 'none';
+}
+function setLook(on) {
+  if (followIndex < 0) return;
+  if (on) enterLook();
+  else { lookActive = false; $('ck_look').classList.remove('on'); $('crosshair').style.display = 'block'; }
 }
 
 function enterFollow(idx) {
   followIndex = idx; uSelected.value = idx;
-  lookMode = false; dying = false;
-  controls.enabled = false; controls.autoRotate = false;
+  lookActive = false; dragging = false; dying = false;
+  controls.enabled = false; controls.autoRotate = false;   // OrbitControls is off the whole ride
   controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 74; camera.updateProjectionMatrix();
   followReadTime = 0; followHealth = 100; smoothFwd.set(0, 0, -1);
@@ -748,7 +758,7 @@ function enterFollow(idx) {
 
 function exitFollow() {
   if (followIndex < 0) return;
-  followIndex = -1; uSelected.value = -1; lookMode = false; dying = false;
+  followIndex = -1; uSelected.value = -1; lookActive = false; dragging = false; dying = false;
   controls.enabled = true; controls.autoRotate = false;
   controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 55; camera.updateProjectionMatrix();
@@ -818,6 +828,16 @@ function updateFollowCamera(dt) {
   camera.lookAt(est.addScaledVector(smoothFwd, 30));
 }
 
+function updateLookCamera() {
+  const ship = estShipPos();
+  const cp = Math.cos(lookPitch), sp = Math.sin(lookPitch);
+  camera.position.set(
+    ship.x + lookDist * cp * Math.sin(lookYaw),
+    ship.y + lookDist * sp,
+    ship.z + lookDist * cp * Math.cos(lookYaw));
+  camera.lookAt(ship);
+}
+
 function updateDeathCam() {
   const el = performance.now() - deathTime, k = Math.max(0, 1 - el / 1200), s = 1.7 * k;
   camera.position.set(deathCamPos.x + (Math.random()-0.5)*s,
@@ -828,18 +848,36 @@ function updateDeathCam() {
 }
 
 $('ck_exit').addEventListener('click', exitFollow);
-$('ck_look').addEventListener('click', () => setLookMode(!lookMode));
+$('ck_look').addEventListener('click', () => setLook(!lookActive));
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (k === 'escape') { if (followIndex < 0) return; lookMode ? setLookMode(false) : exitFollow(); }
+  if (k === 'escape') { if (followIndex < 0) return; lookActive ? setLook(false) : exitFollow(); }
   else if (k === 'r') { if (!dying) randomShip(); }
 });
-dom.addEventListener('pointerdown', e => { downX = e.clientX; downY = e.clientY; downT = performance.now(); });
-dom.addEventListener('pointerup', e => {
+dom.addEventListener('pointerdown', e => {
+  downX = lastX = e.clientX; downY = lastY = e.clientY; downT = performance.now(); dragging = true;
+});
+addEventListener('pointermove', e => {
+  if (!dragging || followIndex < 0 || dying) return;       // overview drag is OrbitControls' job
+  const dx = e.clientX - lastX, dy = e.clientY - lastY; lastX = e.clientX; lastY = e.clientY;
+  if (!lookActive && Math.hypot(e.clientX - downX, e.clientY - downY) > 6) enterLook();  // drag to look
+  if (lookActive) {
+    lookYaw -= dx * 0.006;
+    lookPitch = THREE.MathUtils.clamp(lookPitch + dy * 0.006, -1.4, 1.4);
+  }
+});
+addEventListener('pointerup', e => {
+  dragging = false;
   if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6 || performance.now() - downT > 500) return; // a drag
-  if (followIndex >= 0) { if (!lookMode && !dying) exitFollow(); return; }   // forward-view click exits
+  if (followIndex >= 0) return;                            // clicks while riding do nothing (Esc / EXIT)
   doPick(e.clientX, e.clientY);
 });
+dom.addEventListener('wheel', e => {
+  if (followIndex < 0 || dying) return;
+  e.preventDefault();
+  if (!lookActive) enterLook();
+  lookDist = THREE.MathUtils.clamp(lookDist * (1 + e.deltaY * 0.0012), 2.2, 130);
+}, { passive: false });
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -883,8 +921,8 @@ async function frame(dt) {
     } else {
       renderer.compute(followNode); // copy the ridden ship's state into followBuf
       readFollow();                 // tiny 64-byte readback (pending-guarded)
-      if (lookMode) { controls.target.copy(estShipPos()); controls.update(); } // free look around the ship
-      else updateFollowCamera(dt);  // locked cockpit looking out the front
+      if (lookActive) updateLookCamera();  // free orbit around the ship (drag / scroll)
+      else updateFollowCamera(dt);         // locked cockpit looking out the front
     }
   } else {
     controls.autoRotate = state.orbit;
