@@ -395,6 +395,7 @@ const boidsFn = Fn(() => {
     vel.assign(vel.div(sp.max(1e-4)).mul(clamp(sp, uMinSpeed, uMaxSpeed)));
 
     // Manual pilot: the ridden ship ignores AI steering and obeys player input.
+    const dmgScale = float(1.0).toVar();
     If(int(i).equal(int(uSelected)), () => {
       If(uPilot.greaterThan(0.5), () => {
         const f0  = normalize(V.xyz.add(vec3(0.0, 1e-4, 0.0))).toVar();
@@ -405,13 +406,15 @@ const boidsFn = Fn(() => {
                                .add(upv.mul(uPilotPitch.mul(TURN).mul(uDt)))).toVar();
         const spT = clamp(length(V.xyz).add(uPilotThr.mul(uDt).mul(45.0)), uMinSpeed, uMaxSpeed.mul(1.7)).toVar();
         const pv = nf.mul(spT).toVar();
-        If(r.greaterThan(uBound), () => { pv.subAssign(pos.div(r.max(1e-3)).mul(uBoundF.mul(0.6))); });
+        // gentle, far-out containment only — don't yank the player back at the edge
+        If(r.greaterThan(uBound.mul(1.3)), () => { pv.subAssign(pos.div(r.max(1e-3)).mul(uBoundF.mul(0.35))); });
         vel.assign(pv);
+        dmgScale.assign(0.3);          // piloted ship is tankier so you get to fly, not die in 2s
       });
     });
 
     const newPos    = pos.add(vel.mul(uDt));
-    const newHealth = health.sub(enemyHits.mul(uDmg).mul(uDt)).toVar();
+    const newHealth = health.sub(enemyHits.mul(uDmg).mul(uDt).mul(dmgScale)).toVar();
 
     posBuf.element(i).assign(vec4(newPos, newHealth));
     velBuf.element(i).assign(vec4(vel, fac));
@@ -425,7 +428,10 @@ const boidsFn = Fn(() => {
     });
   }).Else(() => {
     // ===================== DEAD AGENT: maybe reinforce =====================
+    // The ship you're riding never respawns — it stays dead so the cockpit
+    // gets a clean explosion + exit instead of an autopilot ship reusing its slot.
     If(float(i).lessThan(uActive), () => {
+     If(int(i).notEqual(int(uSelected)), () => {        // never respawn the ridden ship
       If(uRespawn.greaterThan(0.5), () => {
         If(hash(float(i).mul(2.399963).add(uTime.mul(13.1))).lessThan(uRespRate), () => {
           const sign   = fac.mul(2.0).sub(1.0);
@@ -439,6 +445,7 @@ const boidsFn = Fn(() => {
           velBuf.element(i).assign(vec4(vec3(sign.negate().mul(9.0), 0.0, 0.0), fac));
         });
       });
+     });
     });
   });
 });
@@ -962,11 +969,12 @@ async function frame(dt) {
     if (dying) {
       updateDeathCam();             // hold + shake on the wreck, then exit
     } else {
-      // flight input (auto-takes control on first key)
-      const yaw   = (held.has('d')||held.has('arrowright')?1:0) - (held.has('a')||held.has('arrowleft')?1:0);
-      const pitch = (held.has('w')||held.has('arrowup')?1:0)    - (held.has('s')||held.has('arrowdown')?1:0);
+      // flight input (auto-takes control on first key; axes flipped to feel natural)
+      const yaw   = (held.has('a')||held.has('arrowleft')?1:0) - (held.has('d')||held.has('arrowright')?1:0);
+      const pitch = (held.has('s')||held.has('arrowdown')?1:0) - (held.has('w')||held.has('arrowup')?1:0);
       const thr   = (held.has('shift')?1:0) - (held.has('control')||held.has('x')||held.has(' ')?1:0);
       if (!piloting && (yaw || pitch || thr)) setPilot(true);
+      if (piloting) uPilot.value = 1;   // insurance: manual control never silently reverts
       uPilotYaw.value = yaw; uPilotPitch.value = pitch; uPilotThr.value = thr;
       renderer.compute(followNode); // copy the ridden ship's state into followBuf
       readFollow();                 // tiny 64-byte readback (pending-guarded)
