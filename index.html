@@ -48,14 +48,19 @@
   .btns button.on { background:var(--ok); color:#06250f; border-color:var(--ok); }
   .hint { font-size:10px; color:var(--dim); margin-top:11px; line-height:15px; }
 
-  #cockpit { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); z-index:12;
-    display:none; align-items:center; gap:12px; padding:9px 14px; border-radius:10px;
-    background:rgba(10,14,22,0.8); border:1px solid rgba(255,255,255,0.12); backdrop-filter:blur(6px);
+  #cockpit { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); z-index:12;
+    display:none; align-items:center; gap:14px; padding:9px 15px; border-radius:11px; white-space:nowrap;
+    background:rgba(10,14,22,0.82); border:1px solid rgba(255,255,255,0.13); backdrop-filter:blur(7px);
     color:var(--fg); font-size:12px; letter-spacing:0.4px; box-shadow:0 8px 28px rgba(0,0,0,0.5); }
-  #cockpit b { color:var(--gpu); }
+  #cockpit .lbl { color:var(--dim); }
+  #cockpit b { color:var(--fg); font-variant-numeric:tabular-nums; }
+  #ck_state { font-weight:600; letter-spacing:0.6px; color:var(--gpu); min-width:128px; display:inline-block; }
   #cockpit button { background:rgba(255,255,255,0.08); color:var(--fg); border:1px solid rgba(255,255,255,0.14);
     border-radius:6px; padding:5px 10px; font-size:11px; cursor:pointer; }
   #cockpit button:hover { background:rgba(255,255,255,0.18); }
+  #cockpit button.on { background:var(--gpu); color:#04121c; border-color:var(--gpu); }
+  #flash { position:fixed; inset:0; z-index:13; background:#fff; opacity:0; pointer-events:none;
+    transition:opacity 0.55s ease-out; }
   #crosshair { position:fixed; left:50%; top:50%; width:26px; height:26px; transform:translate(-50%,-50%);
     z-index:11; display:none; pointer-events:none; opacity:0.55; }
   #crosshair::before, #crosshair::after { content:''; position:absolute; background:var(--gpu); }
@@ -116,11 +121,22 @@
       <button id="b_bloom" class="on">BLOOM</button>
       <button id="b_orbit" class="on">ORBIT</button>
     </div>
-    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> to ride its cockpit. two equal fleets clash &amp; flock entirely on the GPU.</div>
+    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> (or press <b style="color:var(--gpu)">R</b>) to ride its cockpit · in cockpit: <b>LOOK</b> to free-look, <b>Esc</b> to back out. two equal fleets clash &amp; flock entirely on the GPU.</div>
   </div>
 
   <div id="crosshair"></div>
-  <div id="cockpit"><span>▶ COCKPIT — ship <b id="ck_id">#0</b></span><span id="ck_team"></span><button id="ck_exit">EXIT (Esc)</button></div>
+  <div id="cockpit">
+    <span>▶ <b id="ck_id">#0</b> <b id="ck_team"></b></span>
+    <span id="ck_state">CRUISING</span>
+    <span><span class="lbl">hull</span> <b id="ck_hp">100</b></span>
+    <span><span class="lbl">spd</span> <b id="ck_spd">0</b></span>
+    <span><span class="lbl">allies</span> <b id="ck_allies">0</b></span>
+    <span><span class="lbl">foes</span> <b id="ck_foes">0</b></span>
+    <span><span class="lbl">foe dist</span> <b id="ck_fdist">—</b></span>
+    <button id="ck_look" title="drag to look around">LOOK</button>
+    <button id="ck_exit">EXIT</button>
+  </div>
+  <div id="flash"></div>
 
   <div id="err"></div>
 
@@ -204,7 +220,10 @@ const counters   = instancedArray(4, 'int').toAtomic();          // [aliveA, ali
 //  (depth<<21 | index) key here; followBuf holds the selected ship's state so we
 //  can read back just 32 bytes/frame to drive a cockpit camera.
 const pickResult = instancedArray(1, 'int').toAtomic();
-const followBuf  = instancedArray(2, 'vec4');                    // [pos+health, vel+faction]
+//  followBuf: [0]=pos+health, [1]=vel+faction (written by followNode each frame),
+//             [2]=(allies, foesInRange, nearestFoeDist^2, speed),
+//             [3]=(sepForce, aliForce, cohForce, seekForce)  (written by boids, selected ship only)
+const followBuf  = instancedArray(4, 'vec4');
 
 // ---------------------------------------------------------------------------
 //  UNIFORMS  (driven by the sliders / clock)
@@ -232,6 +251,7 @@ const uRespRate = uniform(0.03);
 const uSelected = uniform(-1.0);                 // followed ship index (-1 = none)
 const uRayOrig  = uniform(new THREE.Vector3());  // pick ray (world space)
 const uRayDir   = uniform(new THREE.Vector3(0, 0, -1));
+const uRand     = uniform(0.0);                  // seed for "jump to random ship"
 let followIndex = -1;                            // >=0 while riding a ship's cockpit
 
 // ---------------------------------------------------------------------------
@@ -345,16 +365,19 @@ const boidsFn = Fn(() => {
       });
     });
 
-    // Combine steering forces
-    const acc = vec3(0.0).toVar();
+    // Combine steering forces (kept as named terms so the cockpit can show intent)
+    const fSep  = sep.mul(uWSep).toVar();
+    const fAli  = vec3(0.0).toVar();
+    const fCoh  = vec3(0.0).toVar();
+    const fSeek = vec3(0.0).toVar();
     If(cnt.greaterThan(0.5), () => {
-      acc.addAssign(sep.mul(uWSep));
-      acc.addAssign(ali.div(cnt).mul(uWAli));
-      acc.addAssign(coh.div(cnt).sub(pos).mul(uWCoh));
+      fAli.assign(ali.div(cnt).mul(uWAli));
+      fCoh.assign(coh.div(cnt).sub(pos).mul(uWCoh));
     });
     If(nearestD2.lessThan(1e8), () => {
-      acc.addAssign(normalize(enemyDir).mul(uWSeek));
+      fSeek.assign(normalize(enemyDir).mul(uWSeek));
     });
+    const acc = fSep.add(fAli).add(fCoh).add(fSeek).toVar();
     // Soft boundary: steer back toward the centre when straying past BOUND.
     const r = length(pos).toVar();
     If(r.greaterThan(uBound), () => {
@@ -372,6 +395,12 @@ const boidsFn = Fn(() => {
     velBuf.element(i).assign(vec4(vel, fac));
 
     If(newHealth.greaterThan(0.5), () => { atomicAdd(counters.element(int(fac)), int(1)); });
+
+    // Telemetry for the ridden ship: what is it sensing / which urge dominates.
+    If(int(i).equal(int(uSelected)), () => {
+      followBuf.element(int(2)).assign(vec4(cnt, enemyHits, min(nearestD2, float(1e8)), length(vel)));
+      followBuf.element(int(3)).assign(vec4(length(fSep), length(fAli), length(fCoh), length(fSeek)));
+    });
   }).Else(() => {
     // ===================== DEAD AGENT: maybe reinforce =====================
     If(float(i).lessThan(uActive), () => {
@@ -432,6 +461,18 @@ const followNode = Fn(() => {
   followBuf.element(int(0)).assign(posBuf.element(sel));
   followBuf.element(int(1)).assign(velBuf.element(sel));
 })().compute(1);
+
+// "Jump to random ship": every live ship draws a random key; atomicMin picks a
+// uniformly-ish random live one (winner of the smallest key).
+const randPickNode = Fn(() => {
+  const P = posBuf.element(instanceIndex);
+  If(P.w.greaterThan(0.5), () => {
+    const h   = hash(float(instanceIndex).mul(0.7351).add(uRand));   // 0..1 per ship
+    const rq  = clamp(int(h.mul(1023.0)), int(0), int(1023));
+    const key = rq.mul(int(2097152)).add(int(instanceIndex));
+    atomicMin(pickResult.element(0), key);
+  });
+})().compute(MAX);
 
 // ---------------------------------------------------------------------------
 //  RENDER:  one InstancedMesh, positions/orientation read straight from buffers
@@ -601,17 +642,66 @@ $('b_orbit').addEventListener('click', () => {
 });
 
 // ---------------------------------------------------------------------------
-//  CLICK-TO-PICK + COCKPIT CAMERA
+//  CLICK / RANDOM PICK + COCKPIT CAMERA + DEATH EXPLOSION
 // ---------------------------------------------------------------------------
 const raycaster = new THREE.Raycaster();
 const dom = renderer.domElement;
+const ORBIT_MIN = controls.minDistance, ORBIT_MAX = controls.maxDistance;
 const followPos = new THREE.Vector3(), followVel = new THREE.Vector3();
 const smoothFwd = new THREE.Vector3(0, 0, -1), UP = new THREE.Vector3(0, 1, 0);
+const deathCamPos = new THREE.Vector3(), deathLook = new THREE.Vector3();
 let followHealth = 0, followReadTime = 0, followPending = false;
+let lookMode = false, dying = false, deathTime = 0;
 let downX = 0, downY = 0, downT = 0;
 
-// Click ray -> GPU pick pass -> read back the nearest ship's index.
-async function doPick(cx, cy) {
+// --- Death explosion: a CPU particle burst (additive, so bloom makes it pop) -
+const EXP_N = 700;
+const expGeo = new THREE.BufferGeometry();
+const expPos = new Float32Array(EXP_N * 3), expVel = new Float32Array(EXP_N * 3);
+expGeo.setAttribute('position', new THREE.BufferAttribute(expPos, 3));
+const expMat = new THREE.PointsMaterial({ size: 2.4, sizeAttenuation: true, transparent: true,
+  opacity: 1, depthWrite: false, blending: THREE.AdditiveBlending });
+const explosion = new THREE.Points(expGeo, expMat);
+explosion.frustumCulled = false; explosion.visible = false;
+scene.add(explosion);
+let expActive = false, expStart = 0; const EXP_LIFE = 1.5;
+
+function triggerExplosion(p, faction) {
+  expMat.color.setRGB(faction === 0 ? 0.35 : 1.0, faction === 0 ? 0.85 : 0.45, faction === 0 ? 1.0 : 0.2);
+  for (let k = 0; k < EXP_N; k++) {
+    expPos[k*3] = p.x; expPos[k*3+1] = p.y; expPos[k*3+2] = p.z;
+    const u = Math.random()*2 - 1, th = Math.random()*Math.PI*2, s = Math.sqrt(1 - u*u), spd = 6 + Math.random()*44;
+    expVel[k*3] = s*Math.cos(th)*spd; expVel[k*3+1] = u*spd; expVel[k*3+2] = s*Math.sin(th)*spd;
+  }
+  expGeo.attributes.position.needsUpdate = true;
+  explosion.visible = true; expActive = true; expStart = performance.now();
+}
+function updateExplosion(dt) {
+  if (!expActive) return;
+  const t = (performance.now() - expStart) / 1000;
+  if (t >= EXP_LIFE) { expActive = false; explosion.visible = false; return; }
+  const drag = Math.pow(0.18, dt);
+  for (let k = 0; k < EXP_N; k++) {
+    expPos[k*3] += expVel[k*3]*dt; expPos[k*3+1] += expVel[k*3+1]*dt; expPos[k*3+2] += expVel[k*3+2]*dt;
+    expVel[k*3] *= drag; expVel[k*3+1] *= drag; expVel[k*3+2] *= drag;
+  }
+  expGeo.attributes.position.needsUpdate = true;
+  expMat.opacity = Math.max(0, 1 - t / EXP_LIFE);
+  expMat.size = 2.4 + t * 7;
+}
+function flash() {
+  const f = $('flash');
+  f.style.transition = 'none'; f.style.opacity = '0.75';
+  requestAnimationFrame(() => { f.style.transition = 'opacity 0.55s ease-out'; f.style.opacity = '0'; });
+}
+
+// --- Pick (click ray) / random live ship, then ride it ----------------------
+function runPickResult() {
+  return renderer.getArrayBufferAsync(pickResult.value)
+    .then(ab => { const key = new Int32Array(ab)[0]; if (key < 2147483647) enterFollow(key % 2097152); })
+    .catch(() => {});
+}
+function doPick(cx, cy) {
   const r = dom.getBoundingClientRect();
   const ndc = new THREE.Vector2(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
@@ -619,34 +709,67 @@ async function doPick(cx, cy) {
   uRayDir.value.copy(raycaster.ray.direction);
   renderer.compute(pickClearNode);
   renderer.compute(pickNode);
-  let key = 2147483647;
-  try { key = new Int32Array(await renderer.getArrayBufferAsync(pickResult.value))[0]; } catch (e) { return; }
-  if (key >= 2147483647) return;                  // clicked empty space
-  enterFollow(key % 2097152);
+  runPickResult();
+}
+function randomShip() {
+  uRand.value = Math.random() * 997 + 0.123;
+  renderer.compute(pickClearNode);
+  renderer.compute(randPickNode);
+  runPickResult();
+}
+
+function setLookMode(on) {
+  if (followIndex < 0) return;
+  lookMode = on;
+  controls.enabled = on;
+  controls.autoRotate = false;
+  $('ck_look').classList.toggle('on', on);
+  $('crosshair').style.display = on ? 'none' : 'block';
+  if (on) { controls.minDistance = 1.2; controls.maxDistance = 400; }
 }
 
 function enterFollow(idx) {
-  followIndex = idx;
-  uSelected.value = idx;
-  controls.enabled = false;
+  followIndex = idx; uSelected.value = idx;
+  lookMode = false; dying = false;
+  controls.enabled = false; controls.autoRotate = false;
+  controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 74; camera.updateProjectionMatrix();
   followReadTime = 0; followHealth = 100; smoothFwd.set(0, 0, -1);
+  const teamA = (idx % 2 === 0);
   $('ck_id').textContent = '#' + idx;
-  $('ck_team').textContent = (idx % 2 === 0) ? 'CYAN' : 'AMBER';
-  $('ck_team').style.color = (idx % 2 === 0) ? 'var(--teamA)' : 'var(--teamB)';
+  $('ck_team').textContent = teamA ? 'CYAN' : 'AMBER';
+  $('ck_team').style.color = teamA ? 'var(--teamA)' : 'var(--teamB)';
+  $('ck_state').textContent = '◌ ACQUIRING'; $('ck_state').style.color = 'var(--dim)';
+  $('ck_hp').style.color = 'var(--fg)';
+  $('ck_look').classList.remove('on');
   $('cockpit').style.display = 'flex';
   $('crosshair').style.display = 'block';
 }
 
 function exitFollow() {
   if (followIndex < 0) return;
-  followIndex = -1; uSelected.value = -1;
-  controls.enabled = true;
+  followIndex = -1; uSelected.value = -1; lookMode = false; dying = false;
+  controls.enabled = true; controls.autoRotate = false;
+  controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 55; camera.updateProjectionMatrix();
   controls.target.set(0, 0, 0);
   frameCamera();
   $('cockpit').style.display = 'none';
   $('crosshair').style.display = 'none';
+}
+
+function shipDestroyed() {
+  triggerExplosion(followPos, followIndex % 2);
+  flash();
+  dying = true; deathTime = performance.now();
+  deathCamPos.copy(camera.position); deathLook.copy(followPos);
+  $('ck_state').textContent = '✸ DESTROYED'; $('ck_state').style.color = '#ffd27f';
+  $('ck_hp').textContent = '0'; $('ck_hp').style.color = 'var(--teamB)';
+}
+
+function estShipPos() {
+  const tEx = Math.min(0.05, (performance.now() - followReadTime) / 1000);
+  return followPos.clone().addScaledVector(followVel, tEx);
 }
 
 function readFollow() {
@@ -658,27 +781,64 @@ function readFollow() {
     followVel.set(f[4], f[5], f[6]);
     followReadTime = performance.now();
     followPending = false;
-    if (followHealth <= 0.5) exitFollow();         // your ship was destroyed
+    if (followHealth <= 0.5) { if (!dying) shipDestroyed(); return; }
+    updateTelemetry(f);
   }).catch(() => { followPending = false; });
+}
+
+// Turn the ship's sensed state + dominant steering urge into a cockpit readout.
+function updateTelemetry(f) {
+  const allies = Math.round(f[8]), foes = Math.round(f[9]), nd2 = f[10], speed = f[11];
+  const fSep = f[12], fAli = f[13], fCoh = f[14], fSeek = f[15];
+  $('ck_hp').textContent = Math.max(0, Math.round(followHealth));
+  $('ck_hp').style.color = followHealth < 35 ? 'var(--teamB)' : 'var(--fg)';
+  $('ck_spd').textContent = speed.toFixed(0);
+  $('ck_allies').textContent = allies;
+  $('ck_foes').textContent = foes;
+  $('ck_fdist').textContent = nd2 >= 1e7 ? '—' : Math.sqrt(nd2).toFixed(0);
+  let label = 'CRUISING', col = 'var(--gpu)';
+  if (foes > 0) { label = '⚔ ATTACKING'; col = '#ff8a5a'; }
+  else {
+    const m = Math.max(fSep, fAli, fCoh, fSeek);
+    if (m < 0.25)         { label = '· CRUISING';   col = 'var(--gpu)'; }
+    else if (m === fSeek) { label = '➤ HUNTING';    col = '#ffb86b'; }
+    else if (m === fSep)  { label = '✶ EVADING';    col = '#9fe7ff'; }
+    else if (m === fAli)  { label = '⇉ FORMING UP'; col = '#8affc1'; }
+    else                  { label = '◍ REGROUPING'; col = '#c9b6ff'; }
+  }
+  $('ck_state').textContent = label; $('ck_state').style.color = col;
 }
 
 function updateFollowCamera(dt) {
   if (followVel.lengthSq() < 1e-6 || followReadTime === 0) return;
   const fwd = followVel.clone().normalize();
   smoothFwd.lerp(fwd, Math.min(1, dt * 6)).normalize();
-  const tEx = Math.min(0.05, (performance.now() - followReadTime) / 1000);   // hide readback latency
-  const est = followPos.clone().addScaledVector(followVel, tEx);
+  const est = estShipPos();
   camera.position.copy(est).addScaledVector(smoothFwd, -2.6).addScaledVector(UP, 0.9);
   camera.lookAt(est.addScaledVector(smoothFwd, 30));
 }
 
+function updateDeathCam() {
+  const el = performance.now() - deathTime, k = Math.max(0, 1 - el / 1200), s = 1.7 * k;
+  camera.position.set(deathCamPos.x + (Math.random()-0.5)*s,
+                      deathCamPos.y + (Math.random()-0.5)*s,
+                      deathCamPos.z + (Math.random()-0.5)*s);
+  camera.lookAt(deathLook);
+  if (el > 1200) exitFollow();
+}
+
 $('ck_exit').addEventListener('click', exitFollow);
-addEventListener('keydown', e => { if (e.key === 'Escape') exitFollow(); });
+$('ck_look').addEventListener('click', () => setLookMode(!lookMode));
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'escape') { if (followIndex < 0) return; lookMode ? setLookMode(false) : exitFollow(); }
+  else if (k === 'r') { if (!dying) randomShip(); }
+});
 dom.addEventListener('pointerdown', e => { downX = e.clientX; downY = e.clientY; downT = performance.now(); });
 dom.addEventListener('pointerup', e => {
-  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6 || performance.now() - downT > 500) return; // drag
-  if (followIndex >= 0) exitFollow();
-  else doPick(e.clientX, e.clientY);
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6 || performance.now() - downT > 500) return; // a drag
+  if (followIndex >= 0) { if (!lookMode && !dying) exitFollow(); return; }   // forward-view click exits
+  doPick(e.clientX, e.clientY);
 });
 
 addEventListener('resize', () => {
@@ -716,10 +876,16 @@ async function frame(dt) {
     renderer.compute(boidsNode);       // flock + fight + integrate
   }
 
+  updateExplosion(dt);              // debris animates regardless of camera mode
   if (followIndex >= 0) {
-    renderer.compute(followNode);   // copy the ridden ship's state into followBuf
-    readFollow();                   // tiny 32-byte readback (pending-guarded)
-    updateFollowCamera(dt);         // drive the cockpit camera from the latest state
+    if (dying) {
+      updateDeathCam();             // hold + shake on the wreck, then exit
+    } else {
+      renderer.compute(followNode); // copy the ridden ship's state into followBuf
+      readFollow();                 // tiny 64-byte readback (pending-guarded)
+      if (lookMode) { controls.target.copy(estShipPos()); controls.update(); } // free look around the ship
+      else updateFollowCamera(dt);  // locked cockpit looking out the front
+    }
   } else {
     controls.autoRotate = state.orbit;
     controls.autoRotateSpeed = 0.35;
