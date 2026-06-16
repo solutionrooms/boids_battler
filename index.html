@@ -48,6 +48,20 @@
   .btns button.on { background:var(--ok); color:#06250f; border-color:var(--ok); }
   .hint { font-size:10px; color:var(--dim); margin-top:11px; line-height:15px; }
 
+  #cockpit { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); z-index:12;
+    display:none; align-items:center; gap:12px; padding:9px 14px; border-radius:10px;
+    background:rgba(10,14,22,0.8); border:1px solid rgba(255,255,255,0.12); backdrop-filter:blur(6px);
+    color:var(--fg); font-size:12px; letter-spacing:0.4px; box-shadow:0 8px 28px rgba(0,0,0,0.5); }
+  #cockpit b { color:var(--gpu); }
+  #cockpit button { background:rgba(255,255,255,0.08); color:var(--fg); border:1px solid rgba(255,255,255,0.14);
+    border-radius:6px; padding:5px 10px; font-size:11px; cursor:pointer; }
+  #cockpit button:hover { background:rgba(255,255,255,0.18); }
+  #crosshair { position:fixed; left:50%; top:50%; width:26px; height:26px; transform:translate(-50%,-50%);
+    z-index:11; display:none; pointer-events:none; opacity:0.55; }
+  #crosshair::before, #crosshair::after { content:''; position:absolute; background:var(--gpu); }
+  #crosshair::before { left:50%; top:0; width:1px; height:100%; transform:translateX(-50%); }
+  #crosshair::after { top:50%; left:0; height:1px; width:100%; transform:translateY(-50%); }
+
   #err { position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:40px;
     color:#ffd9d2; background:#160c10; font-size:14px; line-height:1.7; white-space:pre-wrap; z-index:50;
     text-align:center; }
@@ -102,8 +116,11 @@
       <button id="b_bloom" class="on">BLOOM</button>
       <button id="b_orbit" class="on">ORBIT</button>
     </div>
-    <div class="hint">drag rotate · scroll zoom · two equal-size fleets clash &amp; flock entirely on the GPU. REINF = respawn fallen ships.</div>
+    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> to ride its cockpit. two equal fleets clash &amp; flock entirely on the GPU.</div>
   </div>
+
+  <div id="crosshair"></div>
+  <div id="cockpit"><span>▶ COCKPIT — ship <b id="ck_id">#0</b></span><span id="ck_team"></span><button id="ck_exit">EXIT (Esc)</button></div>
 
   <div id="err"></div>
 
@@ -115,7 +132,7 @@ import {
   Fn, instanceIndex, instancedArray, uniform, If, Loop,
   float, int, vec3, vec4, ivec3,
   positionGeometry, cross, normalize, length, dot, clamp, mix, max, min, abs, floor, step, hash,
-  atomicAdd, atomicStore, atomicLoad
+  atomicAdd, atomicStore, atomicLoad, atomicMin
 } from 'three/tsl';
 
 const errEl = document.getElementById('err');
@@ -183,6 +200,12 @@ const cellCount  = instancedArray(NUMCELLS, 'int').toAtomic();    // agents per 
 const cellBucket = instancedArray(NUMCELLS * CAP, 'int');         // agent indices per cell
 const counters   = instancedArray(4, 'int').toAtomic();          // [aliveA, aliveB]
 
+//  Click-to-pick: a compute pass ray-tests every ship and atomic-min's a packed
+//  (depth<<21 | index) key here; followBuf holds the selected ship's state so we
+//  can read back just 32 bytes/frame to drive a cockpit camera.
+const pickResult = instancedArray(1, 'int').toAtomic();
+const followBuf  = instancedArray(2, 'vec4');                    // [pos+health, vel+faction]
+
 // ---------------------------------------------------------------------------
 //  UNIFORMS  (driven by the sliders / clock)
 // ---------------------------------------------------------------------------
@@ -206,6 +229,10 @@ const uSpawnBox = uniform(78.0);    // spawn cloud size (scaled)
 const uBoundF   = uniform(10.0);
 const uRespawn  = uniform(1.0);
 const uRespRate = uniform(0.03);
+const uSelected = uniform(-1.0);                 // followed ship index (-1 = none)
+const uRayOrig  = uniform(new THREE.Vector3());  // pick ray (world space)
+const uRayDir   = uniform(new THREE.Vector3(0, 0, -1));
+let followIndex = -1;                            // >=0 while riding a ship's cockpit
 
 // ---------------------------------------------------------------------------
 //  GRID HELPERS (TSL)
@@ -375,6 +402,37 @@ function rebuildKernels() {
   boidsNode   = boidsFn().compute(n);
 }
 
+// --- Click-to-pick (GPU ray test) -----------------------------------------
+// Reset the pick slot to "no hit" (max i32) before each pick.
+const pickClearNode = Fn(() => {
+  atomicStore(pickResult.element(0), int(2147483647));
+})().compute(1);
+
+// Every live ship tests itself against the click ray; the nearest hit inside a
+// thin cone wins via atomicMin on a packed (quantizedDepth<<21 | index) key.
+const pickNode = Fn(() => {
+  const P = posBuf.element(instanceIndex);
+  If(P.w.greaterThan(0.5), () => {
+    const v = P.xyz.sub(uRayOrig);
+    const t = dot(v, uRayDir);                          // distance along the ray
+    If(t.greaterThan(0.0), () => {
+      const perp = length(v.sub(uRayDir.mul(t)));        // perpendicular miss distance
+      If(perp.lessThan(t.mul(0.025).add(1.0)), () => {   // inside a screen-ish cone
+        const tq  = clamp(int(t.mul(2.0)), int(0), int(1023));
+        const key = tq.mul(int(2097152)).add(int(instanceIndex));   // (tq<<21)|index
+        atomicMin(pickResult.element(0), key);
+      });
+    });
+  });
+})().compute(MAX);
+
+// Copy the selected ship's state into the tiny followBuf (read back per frame).
+const followNode = Fn(() => {
+  const sel = int(max(uSelected, 0.0));
+  followBuf.element(int(0)).assign(posBuf.element(sel));
+  followBuf.element(int(1)).assign(velBuf.element(sel));
+})().compute(1);
+
 // ---------------------------------------------------------------------------
 //  RENDER:  one InstancedMesh, positions/orientation read straight from buffers
 // ---------------------------------------------------------------------------
@@ -514,6 +572,7 @@ function frameCamera() {
 }
 
 function reseed(reframe) {
+  exitFollow();                           // a reseed invalidates any followed ship
   applyScale(uActive.value);
   rebuildKernels();                       // size the per-frame dispatch to the new count
   if (reframe !== false) frameCamera();
@@ -539,6 +598,87 @@ $('b_bloom').addEventListener('click', () => {
 $('b_orbit').addEventListener('click', () => {
   state.orbit = !state.orbit;
   $('b_orbit').classList.toggle('on', state.orbit);
+});
+
+// ---------------------------------------------------------------------------
+//  CLICK-TO-PICK + COCKPIT CAMERA
+// ---------------------------------------------------------------------------
+const raycaster = new THREE.Raycaster();
+const dom = renderer.domElement;
+const followPos = new THREE.Vector3(), followVel = new THREE.Vector3();
+const smoothFwd = new THREE.Vector3(0, 0, -1), UP = new THREE.Vector3(0, 1, 0);
+let followHealth = 0, followReadTime = 0, followPending = false;
+let downX = 0, downY = 0, downT = 0;
+
+// Click ray -> GPU pick pass -> read back the nearest ship's index.
+async function doPick(cx, cy) {
+  const r = dom.getBoundingClientRect();
+  const ndc = new THREE.Vector2(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  uRayOrig.value.copy(raycaster.ray.origin);
+  uRayDir.value.copy(raycaster.ray.direction);
+  renderer.compute(pickClearNode);
+  renderer.compute(pickNode);
+  let key = 2147483647;
+  try { key = new Int32Array(await renderer.getArrayBufferAsync(pickResult.value))[0]; } catch (e) { return; }
+  if (key >= 2147483647) return;                  // clicked empty space
+  enterFollow(key % 2097152);
+}
+
+function enterFollow(idx) {
+  followIndex = idx;
+  uSelected.value = idx;
+  controls.enabled = false;
+  camera.fov = 74; camera.updateProjectionMatrix();
+  followReadTime = 0; followHealth = 100; smoothFwd.set(0, 0, -1);
+  $('ck_id').textContent = '#' + idx;
+  $('ck_team').textContent = (idx % 2 === 0) ? 'CYAN' : 'AMBER';
+  $('ck_team').style.color = (idx % 2 === 0) ? 'var(--teamA)' : 'var(--teamB)';
+  $('cockpit').style.display = 'flex';
+  $('crosshair').style.display = 'block';
+}
+
+function exitFollow() {
+  if (followIndex < 0) return;
+  followIndex = -1; uSelected.value = -1;
+  controls.enabled = true;
+  camera.fov = 55; camera.updateProjectionMatrix();
+  controls.target.set(0, 0, 0);
+  frameCamera();
+  $('cockpit').style.display = 'none';
+  $('crosshair').style.display = 'none';
+}
+
+function readFollow() {
+  if (followPending) return;
+  followPending = true;
+  renderer.getArrayBufferAsync(followBuf.value).then(ab => {
+    const f = new Float32Array(ab);
+    followPos.set(f[0], f[1], f[2]); followHealth = f[3];
+    followVel.set(f[4], f[5], f[6]);
+    followReadTime = performance.now();
+    followPending = false;
+    if (followHealth <= 0.5) exitFollow();         // your ship was destroyed
+  }).catch(() => { followPending = false; });
+}
+
+function updateFollowCamera(dt) {
+  if (followVel.lengthSq() < 1e-6 || followReadTime === 0) return;
+  const fwd = followVel.clone().normalize();
+  smoothFwd.lerp(fwd, Math.min(1, dt * 6)).normalize();
+  const tEx = Math.min(0.05, (performance.now() - followReadTime) / 1000);   // hide readback latency
+  const est = followPos.clone().addScaledVector(followVel, tEx);
+  camera.position.copy(est).addScaledVector(smoothFwd, -2.6).addScaledVector(UP, 0.9);
+  camera.lookAt(est.addScaledVector(smoothFwd, 30));
+}
+
+$('ck_exit').addEventListener('click', exitFollow);
+addEventListener('keydown', e => { if (e.key === 'Escape') exitFollow(); });
+dom.addEventListener('pointerdown', e => { downX = e.clientX; downY = e.clientY; downT = performance.now(); });
+dom.addEventListener('pointerup', e => {
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6 || performance.now() - downT > 500) return; // drag
+  if (followIndex >= 0) exitFollow();
+  else doPick(e.clientX, e.clientY);
 });
 
 addEventListener('resize', () => {
@@ -576,9 +716,15 @@ async function frame(dt) {
     renderer.compute(boidsNode);       // flock + fight + integrate
   }
 
-  controls.autoRotate = state.orbit;
-  controls.autoRotateSpeed = 0.35;
-  controls.update();
+  if (followIndex >= 0) {
+    renderer.compute(followNode);   // copy the ridden ship's state into followBuf
+    readFollow();                   // tiny 32-byte readback (pending-guarded)
+    updateFollowCamera(dt);         // drive the cockpit camera from the latest state
+  } else {
+    controls.autoRotate = state.orbit;
+    controls.autoRotateSpeed = 0.35;
+    controls.update();
+  }
 
   if (state.bloom && post) await post.renderAsync();
   else await renderer.renderAsync(scene, camera);
