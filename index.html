@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SWARM — WebGPU compute boids battler</title>
+<style>
+  :root { --fg:#eaf0f8; --dim:#8b97ad; --ok:#5ad28b; --warn:#ffb03a; --gpu:#7fd0ff;
+          --teamA:#37c6ff; --teamB:#ff6a3d; }
+  html, body { margin:0; height:100%; overflow:hidden; background:#04060c; }
+  canvas { display:block; }
+  * { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  #hud {
+    position:fixed; top:14px; left:14px; z-index:10;
+    color:var(--fg); background:rgba(10,14,22,0.78);
+    border:1px solid rgba(255,255,255,0.10); border-radius:12px;
+    padding:13px 15px 12px; width:248px; backdrop-filter:blur(7px);
+    box-shadow:0 10px 34px rgba(0,0,0,0.55); user-select:none;
+  }
+  #hud .title { font-size:12px; letter-spacing:2px; color:var(--fg); margin-bottom:2px; font-weight:600; }
+  #hud .sub { font-size:9.5px; letter-spacing:1.2px; color:var(--dim); margin-bottom:10px; }
+  #hud .row { display:flex; justify-content:space-between; font-size:12px; line-height:21px; }
+  #hud .k { color:var(--dim); } #hud .v { color:var(--fg); font-variant-numeric:tabular-nums; }
+  #hud .v.gpu { color:var(--gpu); } #hud .v.a { color:var(--teamA); } #hud .v.b { color:var(--teamB); }
+
+  /* faction strength bar */
+  #bar { height:7px; border-radius:4px; margin:8px 0 4px; overflow:hidden;
+         display:flex; background:#222; border:1px solid rgba(255,255,255,0.08); }
+  #barA { background:var(--teamA); height:100%; } #barB { background:var(--teamB); height:100%; }
+
+  .grp-label { font-size:9.5px; letter-spacing:1.3px; color:var(--dim); margin-top:13px; margin-bottom:3px; }
+  .sld { display:flex; align-items:center; gap:8px; font-size:11px; line-height:18px; }
+  .sld label { color:var(--dim); flex:0 0 78px; }
+  .sld input[type=range] { flex:1; height:3px; -webkit-appearance:none; appearance:none;
+     background:rgba(255,255,255,0.16); border-radius:3px; outline:none; }
+  .sld input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:11px; height:11px;
+     border-radius:50%; background:var(--gpu); cursor:pointer; box-shadow:0 0 6px rgba(127,208,255,0.7); }
+  .sld .val { flex:0 0 40px; text-align:right; color:var(--fg); font-variant-numeric:tabular-nums; }
+
+  .btns { display:flex; gap:5px; margin-top:9px; flex-wrap:wrap; }
+  .btns button {
+    flex:1 1 0; min-width:44px; text-align:center;
+    background:rgba(255,255,255,0.06); color:var(--fg); border:1px solid rgba(255,255,255,0.10);
+    border-radius:7px; padding:7px 0; font-size:11px; cursor:pointer;
+  }
+  .btns button:hover { background:rgba(255,255,255,0.15); }
+  .btns button.on { background:var(--ok); color:#06250f; border-color:var(--ok); }
+  .hint { font-size:10px; color:var(--dim); margin-top:11px; line-height:15px; }
+
+  #err { position:fixed; inset:0; display:none; align-items:center; justify-content:center; padding:40px;
+    color:#ffd9d2; background:#160c10; font-size:14px; line-height:1.7; white-space:pre-wrap; z-index:50;
+    text-align:center; }
+  #err b { color:#fff; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.184.0/build/three.webgpu.js",
+    "three/webgpu": "https://unpkg.com/three@0.184.0/build/three.webgpu.js",
+    "three/tsl": "https://unpkg.com/three@0.184.0/build/three.tsl.js",
+    "three/addons/": "https://unpkg.com/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="hud">
+    <div class="title">SWARM</div>
+    <div class="sub">WEBGPU · COMPUTE BOIDS BATTLER</div>
+
+    <div class="row"><span class="k">agents (active)</span><span class="v" id="s_count">—</span></div>
+    <div class="row"><span class="k">GPU sim+draw</span><span class="v gpu" id="s_gpu">— ms</span></div>
+    <div class="row"><span class="k">fps</span><span class="v" id="s_fps">—</span></div>
+
+    <div id="bar"><div id="barA" style="width:50%"></div><div id="barB" style="width:50%"></div></div>
+    <div class="row">
+      <span class="v a" id="s_a">CYAN —</span>
+      <span class="v b" id="s_b">— AMBER</span>
+    </div>
+
+    <div class="grp-label">FLOCKING</div>
+    <div class="sld"><label>cohesion</label><input id="r_coh" type="range" min="0" max="3" step="0.05" value="0.9"><span class="val" id="v_coh"></span></div>
+    <div class="sld"><label>alignment</label><input id="r_ali" type="range" min="0" max="3" step="0.05" value="1.1"><span class="val" id="v_ali"></span></div>
+    <div class="sld"><label>separation</label><input id="r_sep" type="range" min="0" max="6" step="0.05" value="2.4"><span class="val" id="v_sep"></span></div>
+    <div class="sld"><label>perception</label><input id="r_per" type="range" min="2.5" max="6.2" step="0.1" value="5.4"><span class="val" id="v_per"></span></div>
+
+    <div class="grp-label">COMBAT</div>
+    <div class="sld"><label>aggression</label><input id="r_seek" type="range" min="0" max="6" step="0.05" value="2.6"><span class="val" id="v_seek"></span></div>
+    <div class="sld"><label>damage</label><input id="r_dmg" type="range" min="0" max="60" step="1" value="22"><span class="val" id="v_dmg"></span></div>
+    <div class="sld"><label>max speed</label><input id="r_spd" type="range" min="6" max="34" step="1" value="20"><span class="val" id="v_spd"></span></div>
+
+    <div class="grp-label">SCALE</div>
+    <div class="sld"><label>agents</label><input id="r_n" type="range" min="5000" max="200000" step="5000" value="100000"><span class="val" id="v_n"></span></div>
+
+    <div class="btns">
+      <button id="b_pause">❚❚</button>
+      <button id="b_reset">RESET</button>
+      <button id="b_respawn" class="on">REINF</button>
+    </div>
+    <div class="btns">
+      <button id="b_bloom" class="on">BLOOM</button>
+      <button id="b_orbit" class="on">ORBIT</button>
+    </div>
+    <div class="hint">drag rotate · scroll zoom · two equal-size fleets clash &amp; flock entirely on the GPU. REINF = respawn fallen ships.</div>
+  </div>
+
+  <div id="err"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { pass } from 'three/tsl';
+import {
+  Fn, instanceIndex, instancedArray, uniform, If, Loop,
+  float, int, vec3, vec4, ivec3,
+  positionGeometry, cross, normalize, length, dot, clamp, mix, max, min, abs, floor, step, hash,
+  atomicAdd, atomicStore, atomicLoad
+} from 'three/tsl';
+
+const errEl = document.getElementById('err');
+function fail(msg) { errEl.style.display = 'flex'; errEl.innerHTML = msg; throw new Error(msg.replace(/<[^>]+>/g,'')); }
+
+if (!navigator.gpu) {
+  fail("<b>WebGPU not available.</b>\n\nThis demo runs its entire 100k-agent simulation in GPU compute shaders.\nUse a recent Chrome, Edge, or Safari Technology Preview with WebGPU enabled.");
+}
+
+// ---------------------------------------------------------------------------
+//  CONSTANTS
+// ---------------------------------------------------------------------------
+const MAX        = 200000;          // hard capacity (buffers sized once)
+const BOUND      = 140.0;           // soft boundary radius the fleets roam in
+const WORLD_HALF = 170.0;           // half-extent of the spatial grid cube
+const GRIDN      = 52;              // cells per axis
+const CELL       = (2 * WORLD_HALF) / GRIDN;   // ~6.54 — must be >= max perception
+const NUMCELLS   = GRIDN * GRIDN * GRIDN;
+const CAP        = 24;              // max agents stored per grid cell
+const SPAWN      = 95.0;            // |x| of each fleet's spawn centre
+const SPAWNBOX   = 78.0;            // spawn cloud size
+const SHIP_LEN   = 1.9;             // ship size
+
+// ---------------------------------------------------------------------------
+//  RENDERER
+// ---------------------------------------------------------------------------
+const renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.NoToneMapping;
+document.body.appendChild(renderer.domElement);
+
+try { await renderer.init(); }
+catch (e) { fail("<b>WebGPU failed to initialise.</b>\n\n" + e.message); }
+
+if (!(renderer.backend && renderer.backend.isWebGPUBackend)) {
+  fail("<b>WebGPU backend unavailable.</b>\n\nThe renderer fell back to WebGL2, which cannot run the compute simulation.");
+}
+
+let hasTimestamp = false;
+try { if (renderer.backend && 'trackTimestamp' in renderer.backend) { renderer.backend.trackTimestamp = true; hasTimestamp = true; } } catch (e) {}
+
+const scene  = new THREE.Scene();
+scene.background = new THREE.Color(0x04060c);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 4000);
+camera.position.set(0, 120, 320);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.target.set(0, 0, 0);
+controls.minDistance = 40;
+controls.maxDistance = 900;
+
+// ---------------------------------------------------------------------------
+//  STORAGE BUFFERS  — the entire entity state lives on the GPU
+// ---------------------------------------------------------------------------
+//  posBuf : xyz = position, w = health  ( health<=0 => dead )
+//  velBuf : xyz = velocity, w = faction  ( 0 = cyan, 1 = amber )
+const posBuf = instancedArray(MAX, 'vec4');
+const velBuf = instancedArray(MAX, 'vec4');
+
+//  Uniform spatial grid, rebuilt every frame on the GPU (atomic bucket fill).
+const cellCount  = instancedArray(NUMCELLS, 'int').toAtomic();    // agents per cell
+const cellBucket = instancedArray(NUMCELLS * CAP, 'int');         // agent indices per cell
+const counters   = instancedArray(4, 'int').toAtomic();          // [aliveA, aliveB]
+
+// ---------------------------------------------------------------------------
+//  UNIFORMS  (driven by the sliders / clock)
+// ---------------------------------------------------------------------------
+const uDt       = uniform(0.0);
+const uTime     = uniform(0.0);
+const uSeed     = uniform(0.0);
+const uActive   = uniform(100000.0);
+const uWCoh     = uniform(0.9);
+const uWAli     = uniform(1.1);
+const uWSep     = uniform(2.4);
+const uWSeek    = uniform(2.6);
+const uPercept2 = uniform(5.4 * 5.4);
+const uSep2     = uniform(2.6 * 2.6);
+const uKill2    = uniform(3.2 * 3.2);
+const uDmg      = uniform(22.0);
+const uMaxSpeed = uniform(20.0);
+const uMinSpeed = uniform(6.0);
+const uBound    = uniform(BOUND);
+const uBoundF   = uniform(10.0);
+const uRespawn  = uniform(1.0);
+const uRespRate = uniform(0.03);
+
+// ---------------------------------------------------------------------------
+//  GRID HELPERS (TSL)
+// ---------------------------------------------------------------------------
+const cellOf = (p) => {
+  const f = p.add(WORLD_HALF).div(CELL);
+  return ivec3(floor(f)).max(ivec3(0)).min(ivec3(GRIDN - 1));
+};
+const cellIdx = (c) => c.x.add(c.y.mul(int(GRIDN))).add(c.z.mul(int(GRIDN * GRIDN)));
+
+// deterministic-per-agent pseudo-random in [0,1)
+const rnd = (k) => hash(float(instanceIndex).mul(0.6180339).add(uSeed).add(k));
+
+// ---------------------------------------------------------------------------
+//  COMPUTE KERNELS
+// ---------------------------------------------------------------------------
+
+// (Re)seed all agents: first half -> faction A (left), second half -> B (right).
+const seedKernel = Fn(() => {
+  const alive = float(instanceIndex).lessThan(uActive);
+  If(alive, () => {
+    // Faction by index parity (not by half): keeps the two fleets equal AND
+    // unbiased when dense grid cells overflow the per-cell capacity.
+    const fac    = float(instanceIndex.modInt(2));                 // even -> A (cyan), odd -> B (amber)
+    const sign   = fac.mul(2.0).sub(1.0);                          // -1 (A) / +1 (B)
+    const center = vec3(sign.mul(SPAWN), 0.0, 0.0);
+    const off    = vec3(rnd(11.3).sub(0.5), rnd(27.7).sub(0.5), rnd(53.1).sub(0.5)).mul(SPAWNBOX);
+    const p      = center.add(off);
+    // initial velocity: charge toward the enemy line, with a little spread
+    const v = normalize(vec3(sign.negate().mul(0.8), rnd(71.9).sub(0.5), rnd(91.3).sub(0.5))).mul(9.0);
+    posBuf.element(instanceIndex).assign(vec4(p, 100.0));
+    velBuf.element(instanceIndex).assign(vec4(v, fac));
+  }).Else(() => {
+    posBuf.element(instanceIndex).assign(vec4(0.0));   // inactive tail -> dead
+    velBuf.element(instanceIndex).assign(vec4(0.0));
+  });
+})().compute(MAX);
+
+// Clear the grid counts (and the two alive-counters) each frame.
+const clearKernel = Fn(() => {
+  atomicStore(cellCount.element(instanceIndex), int(0));
+  If(instanceIndex.lessThan(2), () => {
+    atomicStore(counters.element(int(instanceIndex)), int(0));
+  });
+})().compute(NUMCELLS);
+
+// Scatter every live agent into its grid cell's bucket (atomic slot claim).
+const scatterKernel = Fn(() => {
+  const P = posBuf.element(instanceIndex);
+  If(P.w.greaterThan(0.5), () => {
+    const cid  = cellIdx(cellOf(P.xyz));
+    const slot = atomicAdd(cellCount.element(cid), int(1)).toVar();
+    If(slot.lessThan(int(CAP)), () => {
+      cellBucket.element(cid.mul(int(CAP)).add(slot)).assign(int(instanceIndex));
+    });
+  });
+})().compute(MAX);
+
+// The main simulation: boids flocking (same faction) + seek/attack (enemies).
+const boidsKernel = Fn(() => {
+  const i = instanceIndex;
+  const P = posBuf.element(i).toVar();
+  const V = velBuf.element(i).toVar();
+  const fac = V.w;
+
+  If(P.w.greaterThan(0.5), () => {
+    // ===================== LIVE AGENT =====================
+    const pos    = P.xyz.toVar();
+    const health = P.w.toVar();
+
+    const sep   = vec3(0.0).toVar();
+    const ali   = vec3(0.0).toVar();
+    const coh   = vec3(0.0).toVar();
+    const cnt   = float(0.0).toVar();
+    const enemyDir  = vec3(0.0).toVar();
+    const nearestD2 = float(1e9).toVar();
+    const enemyHits = float(0.0).toVar();
+
+    const gc = cellOf(pos);
+
+    Loop({ start: int(-1), end: int(2) }, ({ i: dx }) => {
+      Loop({ start: int(-1), end: int(2) }, ({ i: dy }) => {
+        Loop({ start: int(-1), end: int(2) }, ({ i: dz }) => {
+          const cc  = gc.add(ivec3(dx, dy, dz)).max(ivec3(0)).min(ivec3(GRIDN - 1));
+          const cid = cellIdx(cc);
+          const n   = min(atomicLoad(cellCount.element(cid)), int(CAP)).toVar();
+          Loop(n, ({ i: s }) => {
+            const j = cellBucket.element(cid.mul(int(CAP)).add(s)).toVar();
+            If(j.notEqual(int(i)), () => {
+              const PJ = posBuf.element(j);
+              const VJ = velBuf.element(j);
+              const dpos = PJ.xyz.sub(pos).toVar();
+              const d2   = dot(dpos, dpos).add(1e-4).toVar();
+              If(d2.lessThan(uPercept2), () => {
+                If(abs(VJ.w.sub(fac)).lessThan(0.5), () => {
+                  // --- same faction: classic boids ---
+                  cnt.addAssign(1.0);
+                  coh.addAssign(PJ.xyz);
+                  ali.addAssign(VJ.xyz);
+                  If(d2.lessThan(uSep2), () => { sep.subAssign(dpos.div(d2)); });
+                }).Else(() => {
+                  // --- enemy: track nearest + tally hits in kill range ---
+                  If(d2.lessThan(nearestD2), () => { nearestD2.assign(d2); enemyDir.assign(dpos); });
+                  If(d2.lessThan(uKill2), () => { enemyHits.addAssign(1.0); });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+
+    // Combine steering forces
+    const acc = vec3(0.0).toVar();
+    If(cnt.greaterThan(0.5), () => {
+      acc.addAssign(sep.mul(uWSep));
+      acc.addAssign(ali.div(cnt).mul(uWAli));
+      acc.addAssign(coh.div(cnt).sub(pos).mul(uWCoh));
+    });
+    If(nearestD2.lessThan(1e8), () => {
+      acc.addAssign(normalize(enemyDir).mul(uWSeek));
+    });
+    // Soft boundary: steer back toward the centre when straying past BOUND.
+    const r = length(pos).toVar();
+    If(r.greaterThan(uBound), () => {
+      acc.subAssign(pos.div(r.max(1e-3)).mul(uBoundF));
+    });
+
+    // Integrate velocity (speed-clamped) and position
+    const vel = V.xyz.add(acc.mul(uDt)).toVar();
+    const sp  = length(vel).toVar();
+    vel.assign(vel.div(sp.max(1e-4)).mul(clamp(sp, uMinSpeed, uMaxSpeed)));
+    const newPos    = pos.add(vel.mul(uDt));
+    const newHealth = health.sub(enemyHits.mul(uDmg).mul(uDt)).toVar();
+
+    posBuf.element(i).assign(vec4(newPos, newHealth));
+    velBuf.element(i).assign(vec4(vel, fac));
+
+    If(newHealth.greaterThan(0.5), () => { atomicAdd(counters.element(int(fac)), int(1)); });
+  }).Else(() => {
+    // ===================== DEAD AGENT: maybe reinforce =====================
+    If(float(i).lessThan(uActive), () => {
+      If(uRespawn.greaterThan(0.5), () => {
+        If(hash(float(i).mul(2.399963).add(uTime.mul(13.1))).lessThan(uRespRate), () => {
+          const sign   = fac.mul(2.0).sub(1.0);
+          const center = vec3(sign.mul(SPAWN), 0.0, 0.0);
+          const off    = vec3(
+            hash(float(i).add(uTime).add(3.1)).sub(0.5),
+            hash(float(i).add(uTime).add(7.7)).sub(0.5),
+            hash(float(i).add(uTime).add(9.3)).sub(0.5)
+          ).mul(SPAWNBOX);
+          posBuf.element(i).assign(vec4(center.add(off), 100.0));
+          velBuf.element(i).assign(vec4(vec3(sign.negate().mul(9.0), 0.0, 0.0), fac));
+        });
+      });
+    });
+  });
+})().compute(MAX);
+
+// ---------------------------------------------------------------------------
+//  RENDER:  one InstancedMesh, positions/orientation read straight from buffers
+// ---------------------------------------------------------------------------
+const shipGeo = new THREE.ConeGeometry(0.5, 1.0, 5);   // points +Y; orient to velocity below
+shipGeo.translate(0, 0.15, 0);
+const shipMat = new THREE.MeshBasicNodeMaterial();
+shipMat.toneMapped = false;
+
+shipMat.positionNode = Fn(() => {
+  const P = posBuf.element(instanceIndex);
+  const V = velBuf.element(instanceIndex);
+  const local = positionGeometry;
+  const aliveF = step(0.5, P.w);
+
+  // Build an orthonormal basis that maps the cone's local +Y onto the velocity.
+  const fwd   = normalize(V.xyz.add(vec3(0.0, 1e-4, 0.0)));
+  const upRef = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), step(0.99, abs(fwd.y)));
+  const right = normalize(cross(upRef, fwd));
+  const up    = cross(fwd, right);
+  const oriented = right.mul(local.x).add(fwd.mul(local.y)).add(up.mul(local.z)).mul(SHIP_LEN);
+
+  // dead -> collapse to a point (degenerate, invisible)
+  return P.xyz.add(oriented.mul(aliveF));
+})();
+
+shipMat.colorNode = Fn(() => {
+  const V = velBuf.element(instanceIndex);
+  const P = posBuf.element(instanceIndex);
+  const colA = vec3(0.20, 0.78, 1.0);    // cyan
+  const colB = vec3(1.0, 0.40, 0.16);    // amber
+  const base = mix(colA, colB, V.w);
+  // brighten low-health ships toward white-hot just before they die (combat sparkle)
+  const hurt = clamp(float(1.0).sub(P.w.mul(0.01)), 0.0, 1.0);
+  return mix(base, vec3(1.5, 1.4, 1.15), hurt.mul(0.45)).mul(1.12);
+})();
+
+const swarm = new THREE.InstancedMesh(shipGeo, shipMat, MAX);
+swarm.frustumCulled = false;
+scene.add(swarm);
+
+// Starfield backdrop
+(function addStars() {
+  const N = 2200, g = new THREE.BufferGeometry(), arr = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const r = 900 + Math.random() * 1400;
+    const t = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+    arr[i*3]   = r * Math.sin(ph) * Math.cos(t);
+    arr[i*3+1] = r * Math.cos(ph);
+    arr[i*3+2] = r * Math.sin(ph) * Math.sin(t);
+  }
+  g.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  const m = new THREE.PointsMaterial({ color: 0x6b7da0, size: 1.6, sizeAttenuation: false, transparent: true, opacity: 0.7 });
+  scene.add(new THREE.Points(g, m));
+})();
+
+// ---------------------------------------------------------------------------
+//  BLOOM (optional — degrades gracefully if the addon misbehaves)
+// ---------------------------------------------------------------------------
+let post = null, bloomPass = null;
+try {
+  const { bloom } = await import('three/addons/tsl/display/BloomNode.js');
+  const scenePass = pass(scene, camera);
+  const scenePassColor = scenePass.getTextureNode();
+  bloomPass = bloom(scenePassColor, 0.62, 0.5, 0.62);
+  post = new THREE.PostProcessing(renderer);
+  post.outputNode = scenePassColor.add(bloomPass);
+} catch (e) { console.warn('[swarm] bloom unavailable, rendering without it:', e); post = null; }
+
+// ---------------------------------------------------------------------------
+//  CONTROLS / HUD WIRING
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const state = { paused: false, bloom: true, orbit: true, respawn: true };
+
+function bindSlider(id, valId, uni, fmt, onChange) {
+  const el = $(id), vl = $(valId);
+  const apply = () => {
+    const x = parseFloat(el.value);
+    if (uni) uni.value = x;
+    vl.textContent = fmt ? fmt(x) : x;
+    if (onChange) onChange(x);
+  };
+  el.addEventListener('input', apply);
+  apply();
+}
+bindSlider('r_coh', 'v_coh', uWCoh, x => x.toFixed(2));
+bindSlider('r_ali', 'v_ali', uWAli, x => x.toFixed(2));
+bindSlider('r_sep', 'v_sep', uWSep, x => x.toFixed(2));
+bindSlider('r_per', 'v_per', null, x => x.toFixed(1), x => {
+  uPercept2.value = x * x;
+  uSep2.value = (x * 0.48) * (x * 0.48);
+});
+bindSlider('r_seek', 'v_seek', uWSeek, x => x.toFixed(2));
+bindSlider('r_dmg', 'v_dmg', uDmg, x => x.toFixed(0));
+bindSlider('r_spd', 'v_spd', uMaxSpeed, x => x.toFixed(0));
+bindSlider('r_n', 'v_n', null, x => (x/1000) + 'k', x => { uActive.value = x; reseed(); });
+
+function reseed() {
+  uSeed.value = Math.random() * 1000;
+  renderer.compute(seedKernel);
+}
+
+$('b_pause').addEventListener('click', () => {
+  state.paused = !state.paused;
+  $('b_pause').textContent = state.paused ? '▶' : '❚❚';
+  $('b_pause').classList.toggle('on', state.paused);
+});
+$('b_reset').addEventListener('click', reseed);
+$('b_respawn').addEventListener('click', () => {
+  state.respawn = !state.respawn;
+  uRespawn.value = state.respawn ? 1.0 : 0.0;
+  $('b_respawn').classList.toggle('on', state.respawn);
+});
+$('b_bloom').addEventListener('click', () => {
+  state.bloom = !state.bloom;
+  $('b_bloom').classList.toggle('on', state.bloom);
+});
+$('b_orbit').addEventListener('click', () => {
+  state.orbit = !state.orbit;
+  $('b_orbit').classList.toggle('on', state.orbit);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  // bloom/scene passes track the renderer size automatically — no manual setSize.
+});
+
+// ---------------------------------------------------------------------------
+//  MAIN LOOP
+// ---------------------------------------------------------------------------
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsShown = 0;
+let gpuMs = 0, readPending = false, aliveA = 0, aliveB = 0, lastRead = 0;
+
+// Throttled faction-count readback — the ONLY CPU readback in the whole app.
+function readCounts(force) {
+  const now = performance.now();
+  if (!force && (readPending || now - lastRead < 160)) return;
+  readPending = true; lastRead = now;
+  renderer.getArrayBufferAsync(counters.value)
+    .then(ab => { const a = new Int32Array(ab); aliveA = a[0]; aliveB = a[1]; readPending = false; updateHUD(); })
+    .catch(() => { readPending = false; });
+}
+
+// One simulation + render step. Compute passes write the entity buffers; the
+// render pipeline reads them straight back — no CPU round-trip for the sim.
+async function frame(dt) {
+  uTime.value += dt;
+  uDt.value = state.paused ? 0.0 : Math.min(dt, 1 / 30);
+
+  if (!state.paused) {
+    renderer.compute(clearKernel);     // zero grid counts
+    renderer.compute(scatterKernel);   // bin live agents into the spatial grid
+    renderer.compute(boidsKernel);     // flock + fight + integrate
+  }
+
+  controls.autoRotate = state.orbit;
+  controls.autoRotateSpeed = 0.35;
+  controls.update();
+
+  if (state.bloom && post) await post.renderAsync();
+  else await renderer.renderAsync(scene, camera);
+
+  if (hasTimestamp) {
+    renderer.resolveTimestampsAsync(THREE.TimestampQuery.RENDER)
+      .then(ms => { if (ms != null && ms < 2000) gpuMs = ms; }).catch(() => {});
+  }
+  readCounts(false);
+}
+
+reseed();   // initial spawn
+
+async function animate() {
+  const now = performance.now();
+  const realDt = (now - last) / 1000; last = now;
+  await frame(realDt);
+  fpsAcc += realDt; fpsN++;
+  if (fpsAcc >= 0.4) { fpsShown = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; updateHUD(); }
+}
+renderer.setAnimationLoop(animate);
+
+// Debug / verification hook (harmless to leave): lets the sim be stepped
+// manually when the tab is backgrounded and rAF is throttled to zero.
+window.__swarm = {
+  frame, reseed, readCounts, state, renderer,
+  get gpuMs() { return gpuMs; },
+  get alive() { return [aliveA, aliveB]; },
+};
+
+function updateHUD() {
+  $('s_count').textContent = (uActive.value / 1000) + 'k';
+  $('s_gpu').textContent = gpuMs ? gpuMs.toFixed(2) + ' ms' : '— ms';
+  $('s_fps').textContent = fpsShown;
+  $('s_a').textContent = 'CYAN ' + aliveA.toLocaleString();
+  $('s_b').textContent = aliveB.toLocaleString() + ' AMBER';
+  const tot = Math.max(1, aliveA + aliveB);
+  $('barA').style.width = (100 * aliveA / tot) + '%';
+  $('barB').style.width = (100 * aliveB / tot) + '%';
+}
+
+console.log('[swarm] WebGPU backend:', renderer.backend.isWebGPUBackend,
+            '| MAX', MAX, '| cells', NUMCELLS, '| cap', CAP, '| bloom', !!post);
+</script>
+</body>
+</html>
