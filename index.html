@@ -121,7 +121,7 @@
       <button id="b_bloom" class="on">BLOOM</button>
       <button id="b_orbit" class="on">ORBIT</button>
     </div>
-    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> (or press <b style="color:var(--gpu)">R</b>) to ride its cockpit · in cockpit: <b>LOOK</b> to free-look, <b>Esc</b> to back out. two equal fleets clash &amp; flock entirely on the GPU.</div>
+    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> (or <b style="color:var(--gpu)">R</b>) to ride · in cockpit: <b>WASD</b>/arrows to fly (Shift boost), drag to look, <b>Esc</b> to back out. all 2M agents flock &amp; fight on the GPU.</div>
   </div>
 
   <div id="crosshair"></div>
@@ -133,6 +133,7 @@
     <span><span class="lbl">allies</span> <b id="ck_allies">0</b></span>
     <span><span class="lbl">foes</span> <b id="ck_foes">0</b></span>
     <span><span class="lbl">foe dist</span> <b id="ck_fdist">—</b></span>
+    <button id="ck_pilot" title="WASD / arrows to fly, Shift boost">PILOT</button>
     <button id="ck_look" title="drag to look around">LOOK</button>
     <button id="ck_exit">EXIT</button>
   </div>
@@ -251,7 +252,11 @@ const uRespRate = uniform(0.03);
 const uSelected = uniform(-1.0);                 // followed ship index (-1 = none)
 const uRayOrig  = uniform(new THREE.Vector3());  // pick ray (world space)
 const uRayDir   = uniform(new THREE.Vector3(0, 0, -1));
-const uRand     = uniform(0.0);                  // seed for "jump to random ship"
+const uRand      = uniform(0.0);                 // seed for "jump to random ship"
+const uPilot     = uniform(0.0);                 // 1 = player flies the ridden ship
+const uPilotYaw  = uniform(0.0);                 // steering input (-1..1)
+const uPilotPitch= uniform(0.0);
+const uPilotThr  = uniform(0.0);                 // throttle input (-1 brake .. +1 boost)
 let followIndex = -1;                            // >=0 while riding a ship's cockpit
 
 // ---------------------------------------------------------------------------
@@ -388,6 +393,23 @@ const boidsFn = Fn(() => {
     const vel = V.xyz.add(acc.mul(uDt)).toVar();
     const sp  = length(vel).toVar();
     vel.assign(vel.div(sp.max(1e-4)).mul(clamp(sp, uMinSpeed, uMaxSpeed)));
+
+    // Manual pilot: the ridden ship ignores AI steering and obeys player input.
+    If(int(i).equal(int(uSelected)), () => {
+      If(uPilot.greaterThan(0.5), () => {
+        const f0  = normalize(V.xyz.add(vec3(0.0, 1e-4, 0.0))).toVar();
+        const rgt = normalize(cross(vec3(0.0, 1.0, 0.0), f0).add(vec3(1e-4, 0.0, 0.0))).toVar();  // +eps avoids a vertical-flight singularity
+        const upv = cross(f0, rgt);
+        const TURN = float(2.6);
+        const nf = normalize(f0.add(rgt.mul(uPilotYaw.mul(TURN).mul(uDt)))
+                               .add(upv.mul(uPilotPitch.mul(TURN).mul(uDt)))).toVar();
+        const spT = clamp(length(V.xyz).add(uPilotThr.mul(uDt).mul(45.0)), uMinSpeed, uMaxSpeed.mul(1.7)).toVar();
+        const pv = nf.mul(spT).toVar();
+        If(r.greaterThan(uBound), () => { pv.subAssign(pos.div(r.max(1e-3)).mul(uBoundF.mul(0.6))); });
+        vel.assign(pv);
+      });
+    });
+
     const newPos    = pos.add(vel.mul(uDt));
     const newHealth = health.sub(enemyHits.mul(uDmg).mul(uDt)).toVar();
 
@@ -654,6 +676,15 @@ let followHealth = 0, followReadTime = 0, followPending = false;
 let lookActive = false, dying = false, deathTime = 0;
 let dragging = false, downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0;
 let lookYaw = 0, lookPitch = 0.2, lookDist = 7;
+let piloting = false;
+const held = new Set();   // keys currently down (for flight input)
+
+function setPilot(on) {
+  if (followIndex < 0) { piloting = false; uPilot.value = 0; return; }
+  piloting = on;
+  uPilot.value = on ? 1 : 0;
+  $('ck_pilot').classList.toggle('on', on);
+}
 
 // --- Death explosion: a CPU particle burst (additive, so bloom makes it pop) -
 const EXP_N = 700;
@@ -741,6 +772,7 @@ function setLook(on) {
 function enterFollow(idx) {
   followIndex = idx; uSelected.value = idx;
   lookActive = false; dragging = false; dying = false;
+  piloting = false; uPilot.value = 0; $('ck_pilot').classList.remove('on');
   controls.enabled = false; controls.autoRotate = false;   // OrbitControls is off the whole ride
   controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 74; camera.updateProjectionMatrix();
@@ -759,6 +791,7 @@ function enterFollow(idx) {
 function exitFollow() {
   if (followIndex < 0) return;
   followIndex = -1; uSelected.value = -1; lookActive = false; dragging = false; dying = false;
+  piloting = false; uPilot.value = 0; $('ck_pilot').classList.remove('on');
   controls.enabled = true; controls.autoRotate = false;
   controls.minDistance = ORBIT_MIN; controls.maxDistance = ORBIT_MAX;
   camera.fov = 55; camera.updateProjectionMatrix();
@@ -807,7 +840,8 @@ function updateTelemetry(f) {
   $('ck_foes').textContent = foes;
   $('ck_fdist').textContent = nd2 >= 1e7 ? '—' : Math.sqrt(nd2).toFixed(0);
   let label = 'CRUISING', col = 'var(--gpu)';
-  if (foes > 0) { label = '⚔ ATTACKING'; col = '#ff8a5a'; }
+  if (piloting)            { label = '◉ MANUAL';     col = '#ffe08a'; }
+  else if (foes > 0)       { label = '⚔ ATTACKING';  col = '#ff8a5a'; }
   else {
     const m = Math.max(fSep, fAli, fCoh, fSeek);
     if (m < 0.25)         { label = '· CRUISING';   col = 'var(--gpu)'; }
@@ -849,11 +883,20 @@ function updateDeathCam() {
 
 $('ck_exit').addEventListener('click', exitFollow);
 $('ck_look').addEventListener('click', () => setLook(!lookActive));
+$('ck_pilot').addEventListener('click', () => setPilot(!piloting));
+const FLY_KEYS = new Set(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','shift','control','x',' ']);
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (k === 'escape') { if (followIndex < 0) return; lookActive ? setLook(false) : exitFollow(); }
-  else if (k === 'r') { if (!dying) randomShip(); }
+  if (k === 'escape') { if (followIndex < 0) return; lookActive ? setLook(false) : exitFollow(); return; }
+  if (k === 'r') { if (!dying) randomShip(); return; }
+  if (k === 'p') { if (followIndex >= 0 && !dying) setPilot(!piloting); return; }
+  if (FLY_KEYS.has(k)) {
+    held.add(k);
+    if (followIndex >= 0) e.preventDefault();   // don't scroll the page while flying
+  }
 });
+addEventListener('keyup', e => held.delete(e.key.toLowerCase()));
+addEventListener('blur', () => held.clear());
 dom.addEventListener('pointerdown', e => {
   downX = lastX = e.clientX; downY = lastY = e.clientY; downT = performance.now(); dragging = true;
 });
@@ -919,6 +962,12 @@ async function frame(dt) {
     if (dying) {
       updateDeathCam();             // hold + shake on the wreck, then exit
     } else {
+      // flight input (auto-takes control on first key)
+      const yaw   = (held.has('d')||held.has('arrowright')?1:0) - (held.has('a')||held.has('arrowleft')?1:0);
+      const pitch = (held.has('w')||held.has('arrowup')?1:0)    - (held.has('s')||held.has('arrowdown')?1:0);
+      const thr   = (held.has('shift')?1:0) - (held.has('control')||held.has('x')||held.has(' ')?1:0);
+      if (!piloting && (yaw || pitch || thr)) setPilot(true);
+      uPilotYaw.value = yaw; uPilotPitch.value = pitch; uPilotThr.value = thr;
       renderer.compute(followNode); // copy the ridden ship's state into followBuf
       readFollow();                 // tiny 64-byte readback (pending-guarded)
       if (lookActive) updateLookCamera();  // free orbit around the ship (drag / scroll)
