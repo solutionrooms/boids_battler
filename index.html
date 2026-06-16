@@ -83,7 +83,7 @@
     <div class="sld"><label>cohesion</label><input id="r_coh" type="range" min="0" max="3" step="0.05" value="0.9"><span class="val" id="v_coh"></span></div>
     <div class="sld"><label>alignment</label><input id="r_ali" type="range" min="0" max="3" step="0.05" value="1.1"><span class="val" id="v_ali"></span></div>
     <div class="sld"><label>separation</label><input id="r_sep" type="range" min="0" max="6" step="0.05" value="2.4"><span class="val" id="v_sep"></span></div>
-    <div class="sld"><label>perception</label><input id="r_per" type="range" min="2.5" max="6.2" step="0.1" value="5.4"><span class="val" id="v_per"></span></div>
+    <div class="sld"><label>perception</label><input id="r_per" type="range" min="2.5" max="5.8" step="0.1" value="5.4"><span class="val" id="v_per"></span></div>
 
     <div class="grp-label">COMBAT</div>
     <div class="sld"><label>aggression</label><input id="r_seek" type="range" min="0" max="6" step="0.05" value="2.6"><span class="val" id="v_seek"></span></div>
@@ -91,7 +91,7 @@
     <div class="sld"><label>max speed</label><input id="r_spd" type="range" min="6" max="34" step="1" value="20"><span class="val" id="v_spd"></span></div>
 
     <div class="grp-label">SCALE</div>
-    <div class="sld"><label>agents</label><input id="r_n" type="range" min="5000" max="200000" step="5000" value="100000"><span class="val" id="v_n"></span></div>
+    <div class="sld"><label>agents</label><input id="r_n" type="range" min="0" max="1000" step="1" value="500"><span class="val" id="v_n"></span></div>
 
     <div class="btns">
       <button id="b_pause">❚❚</button>
@@ -128,16 +128,16 @@ if (!navigator.gpu) {
 // ---------------------------------------------------------------------------
 //  CONSTANTS
 // ---------------------------------------------------------------------------
-const MAX        = 200000;          // hard capacity (buffers sized once)
-const BOUND      = 140.0;           // soft boundary radius the fleets roam in
-const WORLD_HALF = 170.0;           // half-extent of the spatial grid cube
-const GRIDN      = 52;              // cells per axis
-const CELL       = (2 * WORLD_HALF) / GRIDN;   // ~6.54 — must be >= max perception
-const NUMCELLS   = GRIDN * GRIDN * GRIDN;
-const CAP        = 24;              // max agents stored per grid cell
-const SPAWN      = 95.0;            // |x| of each fleet's spawn centre
-const SPAWNBOX   = 78.0;            // spawn cloud size
+const MAX        = 2000000;         // hard capacity (buffers sized once) — up to 2M agents
+const WORLD_HALF = 252.0;           // half-extent of the spatial grid cube
+const GRIDN      = 84;              // cells per axis
+const CELL       = (2 * WORLD_HALF) / GRIDN;   // 6.0 — must be >= max perception
+const NUMCELLS   = GRIDN * GRIDN * GRIDN;      // ~593k cells
+const CAP        = 32;              // max agents stored per grid cell
 const SHIP_LEN   = 1.9;             // ship size
+// The arena (spawn extents + boundary) scales with the live agent count so the
+// crowding stays roughly constant from 5k to 2M — see applyScale(). That keeps
+// the grid's per-cell occupancy bounded instead of overflowing at high counts.
 
 // ---------------------------------------------------------------------------
 //  RENDERER
@@ -200,7 +200,9 @@ const uKill2    = uniform(3.2 * 3.2);
 const uDmg      = uniform(22.0);
 const uMaxSpeed = uniform(20.0);
 const uMinSpeed = uniform(6.0);
-const uBound    = uniform(BOUND);
+const uBound    = uniform(140.0);   // soft boundary radius (set by applyScale)
+const uSpawn    = uniform(95.0);    // |x| of each fleet's spawn centre (scaled)
+const uSpawnBox = uniform(78.0);    // spawn cloud size (scaled)
 const uBoundF   = uniform(10.0);
 const uRespawn  = uniform(1.0);
 const uRespRate = uniform(0.03);
@@ -229,8 +231,8 @@ const seedKernel = Fn(() => {
     // unbiased when dense grid cells overflow the per-cell capacity.
     const fac    = float(instanceIndex.modInt(2));                 // even -> A (cyan), odd -> B (amber)
     const sign   = fac.mul(2.0).sub(1.0);                          // -1 (A) / +1 (B)
-    const center = vec3(sign.mul(SPAWN), 0.0, 0.0);
-    const off    = vec3(rnd(11.3).sub(0.5), rnd(27.7).sub(0.5), rnd(53.1).sub(0.5)).mul(SPAWNBOX);
+    const center = vec3(sign.mul(uSpawn), 0.0, 0.0);
+    const off    = vec3(rnd(11.3).sub(0.5), rnd(27.7).sub(0.5), rnd(53.1).sub(0.5)).mul(uSpawnBox);
     const p      = center.add(off);
     // initial velocity: charge toward the enemy line, with a little spread
     const v = normalize(vec3(sign.negate().mul(0.8), rnd(71.9).sub(0.5), rnd(91.3).sub(0.5))).mul(9.0);
@@ -251,7 +253,7 @@ const clearKernel = Fn(() => {
 })().compute(NUMCELLS);
 
 // Scatter every live agent into its grid cell's bucket (atomic slot claim).
-const scatterKernel = Fn(() => {
+const scatterFn = Fn(() => {
   const P = posBuf.element(instanceIndex);
   If(P.w.greaterThan(0.5), () => {
     const cid  = cellIdx(cellOf(P.xyz));
@@ -260,10 +262,10 @@ const scatterKernel = Fn(() => {
       cellBucket.element(cid.mul(int(CAP)).add(slot)).assign(int(instanceIndex));
     });
   });
-})().compute(MAX);
+});
 
 // The main simulation: boids flocking (same faction) + seek/attack (enemies).
-const boidsKernel = Fn(() => {
+const boidsFn = Fn(() => {
   const i = instanceIndex;
   const P = posBuf.element(i).toVar();
   const V = velBuf.element(i).toVar();
@@ -349,19 +351,29 @@ const boidsKernel = Fn(() => {
       If(uRespawn.greaterThan(0.5), () => {
         If(hash(float(i).mul(2.399963).add(uTime.mul(13.1))).lessThan(uRespRate), () => {
           const sign   = fac.mul(2.0).sub(1.0);
-          const center = vec3(sign.mul(SPAWN), 0.0, 0.0);
+          const center = vec3(sign.mul(uSpawn), 0.0, 0.0);
           const off    = vec3(
             hash(float(i).add(uTime).add(3.1)).sub(0.5),
             hash(float(i).add(uTime).add(7.7)).sub(0.5),
             hash(float(i).add(uTime).add(9.3)).sub(0.5)
-          ).mul(SPAWNBOX);
+          ).mul(uSpawnBox);
           posBuf.element(i).assign(vec4(center.add(off), 100.0));
           velBuf.element(i).assign(vec4(vec3(sign.negate().mul(9.0), 0.0, 0.0), fac));
         });
       });
     });
   });
-})().compute(MAX);
+});
+
+// Scatter + boids dispatch only over the *active* agents (not the full 2M
+// capacity), so low counts stay cheap. Rebuilt when the count is committed —
+// same WGSL, so Three reuses the cached pipeline; only the dispatch size changes.
+let scatterNode = null, boidsNode = null;
+function rebuildKernels() {
+  const n = Math.min(MAX, Math.max(256, Math.ceil(uActive.value / 256) * 256));
+  scatterNode = scatterFn().compute(n);
+  boidsNode   = boidsFn().compute(n);
+}
 
 // ---------------------------------------------------------------------------
 //  RENDER:  one InstancedMesh, positions/orientation read straight from buffers
@@ -391,9 +403,13 @@ shipMat.positionNode = Fn(() => {
 shipMat.colorNode = Fn(() => {
   const V = velBuf.element(instanceIndex);
   const P = posBuf.element(instanceIndex);
-  const colA = vec3(0.20, 0.78, 1.0);    // cyan
-  const colB = vec3(1.0, 0.40, 0.16);    // amber
-  const base = mix(colA, colB, V.w);
+  // Per-ship, stable random spread so each fleet is a *range* of shades, not one flat colour.
+  const rHue = hash(float(instanceIndex).mul(0.3719).add(0.137));   // where in the palette
+  const rBri = hash(float(instanceIndex).mul(0.9137).add(0.561));   // brightness jitter
+  // Faction palettes span a hue range: cyan fleet teal->blue, amber fleet red->gold.
+  const colA = mix(vec3(0.10, 0.42, 1.0),  vec3(0.30, 1.0, 0.92), rHue);
+  const colB = mix(vec3(1.0, 0.20, 0.10),  vec3(1.0, 0.74, 0.18), rHue);
+  const base = mix(colA, colB, V.w).mul(mix(0.78, 1.32, rBri));
   // brighten low-health ships toward white-hot just before they die (combat sparkle)
   const hurt = clamp(float(1.0).sub(P.w.mul(0.01)), 0.0, 1.0);
   return mix(base, vec3(1.5, 1.4, 1.15), hurt.mul(0.45)).mul(1.12);
@@ -458,9 +474,49 @@ bindSlider('r_per', 'v_per', null, x => x.toFixed(1), x => {
 bindSlider('r_seek', 'v_seek', uWSeek, x => x.toFixed(2));
 bindSlider('r_dmg', 'v_dmg', uDmg, x => x.toFixed(0));
 bindSlider('r_spd', 'v_spd', uMaxSpeed, x => x.toFixed(0));
-bindSlider('r_n', 'v_n', null, x => (x/1000) + 'k', x => { uActive.value = x; reseed(); });
+// agents: logarithmic track, t=0..1000 → 5k..2M (exactly 100k at the midpoint t=500)
+const T_TO_N = (t) => {
+  const n = 5000 * Math.pow(400, t / 1000);
+  return Math.min(MAX, Math.max(5000, Math.round(n / 5000) * 5000));
+};
+const fmtCount = (n) => n >= 1e6 ? (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M' : (n / 1000) + 'k';
+{
+  const el = $('r_n'), vl = $('v_n');
+  const preview = () => { vl.textContent = fmtCount(T_TO_N(parseFloat(el.value))); };
+  const commit = (reframe) => {                        // apply on release (not every drag tick)
+    uActive.value = T_TO_N(parseFloat(el.value));
+    vl.textContent = fmtCount(uActive.value);
+    reseed(reframe);
+  };
+  el.addEventListener('input', preview);               // dragging just previews the number
+  el.addEventListener('change', () => commit(true));   // release: reseed at the new scale + reframe
+  commit(true);                                        // initial spawn
+}
 
-function reseed() {
+// The arena (boundary + spawn extents) scales with agent count so crowding —
+// and therefore the spatial grid's per-cell occupancy — stays bounded from 5k
+// to 2M. Constant-ish density ⇒ flocking/combat behave the same at every scale.
+function applyScale(n) {
+  const c = Math.cbrt(n);
+  uBound.value    = Math.min(225.0, 3.00 * c);
+  uSpawn.value    = Math.min(150.0, 2.00 * c);
+  uSpawnBox.value = Math.min(140.0, 1.70 * c);
+}
+
+// Dolly the camera to frame the current arena, preserving the view direction.
+function frameCamera() {
+  const dir = camera.position.clone().sub(controls.target);
+  if (dir.lengthSq() < 1e-6) dir.set(0, 0.4, 1);
+  dir.normalize();
+  const dist = THREE.MathUtils.clamp(uBound.value * 2.7, 130, 820);
+  camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
+  controls.update();
+}
+
+function reseed(reframe) {
+  applyScale(uActive.value);
+  rebuildKernels();                       // size the per-frame dispatch to the new count
+  if (reframe !== false) frameCamera();
   uSeed.value = Math.random() * 1000;
   renderer.compute(seedKernel);
 }
@@ -470,7 +526,7 @@ $('b_pause').addEventListener('click', () => {
   $('b_pause').textContent = state.paused ? '▶' : '❚❚';
   $('b_pause').classList.toggle('on', state.paused);
 });
-$('b_reset').addEventListener('click', reseed);
+$('b_reset').addEventListener('click', () => reseed(true));
 $('b_respawn').addEventListener('click', () => {
   state.respawn = !state.respawn;
   uRespawn.value = state.respawn ? 1.0 : 0.0;
@@ -516,8 +572,8 @@ async function frame(dt) {
 
   if (!state.paused) {
     renderer.compute(clearKernel);     // zero grid counts
-    renderer.compute(scatterKernel);   // bin live agents into the spatial grid
-    renderer.compute(boidsKernel);     // flock + fight + integrate
+    renderer.compute(scatterNode);     // bin live agents into the spatial grid
+    renderer.compute(boidsNode);       // flock + fight + integrate
   }
 
   controls.autoRotate = state.orbit;
@@ -554,7 +610,7 @@ window.__swarm = {
 };
 
 function updateHUD() {
-  $('s_count').textContent = (uActive.value / 1000) + 'k';
+  $('s_count').textContent = fmtCount(uActive.value);
   $('s_gpu').textContent = gpuMs ? gpuMs.toFixed(2) + ' ms' : '— ms';
   $('s_fps').textContent = fpsShown;
   $('s_a').textContent = 'CYAN ' + aliveA.toLocaleString();
