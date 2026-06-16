@@ -225,6 +225,9 @@ const pickResult = instancedArray(1, 'int').toAtomic();
 //             [2]=(allies, foesInRange, nearestFoeDist^2, speed),
 //             [3]=(sepForce, aliForce, cohForce, seekForce)  (written by boids, selected ship only)
 const followBuf  = instancedArray(4, 'vec4');
+//  Authoritative manual-flight velocity (xyz) + initialised flag (w). The AI
+//  never writes this, so the pilot heading can't be hijacked by a stray AI step.
+const pilotState = instancedArray(1, 'vec4');
 
 // ---------------------------------------------------------------------------
 //  UNIFORMS  (driven by the sliders / clock)
@@ -394,22 +397,13 @@ const boidsFn = Fn(() => {
     const sp  = length(vel).toVar();
     vel.assign(vel.div(sp.max(1e-4)).mul(clamp(sp, uMinSpeed, uMaxSpeed)));
 
-    // Manual pilot: the ridden ship ignores AI steering and obeys player input.
+    // Manual pilot: the ridden ship ignores AI steering and flies on the velocity
+    // maintained by pilotStepNode (V.xyz already holds it — see below).
     const dmgScale = float(1.0).toVar();
     If(int(i).equal(int(uSelected)), () => {
       If(uPilot.greaterThan(0.5), () => {
-        const f0  = normalize(V.xyz.add(vec3(0.0, 1e-4, 0.0))).toVar();
-        const rgt = normalize(cross(vec3(0.0, 1.0, 0.0), f0).add(vec3(1e-4, 0.0, 0.0))).toVar();  // +eps avoids a vertical-flight singularity
-        const upv = cross(f0, rgt);
-        const TURN = float(2.6);
-        const nf = normalize(f0.add(rgt.mul(uPilotYaw.mul(TURN).mul(uDt)))
-                               .add(upv.mul(uPilotPitch.mul(TURN).mul(uDt)))).toVar();
-        const spT = clamp(length(V.xyz).add(uPilotThr.mul(uDt).mul(45.0)), uMinSpeed, uMaxSpeed.mul(1.7)).toVar();
-        const pv = nf.mul(spT).toVar();
-        // gentle, far-out containment only — don't yank the player back at the edge
-        If(r.greaterThan(uBound.mul(1.3)), () => { pv.subAssign(pos.div(r.max(1e-3)).mul(uBoundF.mul(0.35))); });
-        vel.assign(pv);
-        dmgScale.assign(0.3);          // piloted ship is tankier so you get to fly, not die in 2s
+        vel.assign(V.xyz);             // pure player heading, no AI contribution
+        dmgScale.assign(0.3);          // tankier so you get to fly, not die in ~2s
       });
     });
 
@@ -489,6 +483,32 @@ const followNode = Fn(() => {
   const sel = int(max(uSelected, 0.0));
   followBuf.element(int(0)).assign(posBuf.element(sel));
   followBuf.element(int(1)).assign(velBuf.element(sel));
+})().compute(1);
+
+// Reset the manual-flight heading (re-seeded from the ship on the next step).
+const pilotResetNode = Fn(() => {
+  pilotState.element(int(0)).assign(vec4(0.0, 0.0, 0.0, 0.0));
+})().compute(1);
+
+// Manual flight: integrate the player's steering into pilotState (the source of
+// truth) and stamp it onto the ridden ship's velocity. Runs after boids each
+// frame, so an occasional stray AI step on the ship self-heals next frame
+// instead of the heading sticking to whatever the AI chose.
+const pilotStepNode = Fn(() => {
+  const sel = int(max(uSelected, 0.0));
+  const sv  = velBuf.element(sel);
+  const ps  = pilotState.element(int(0)).toVar();
+  If(ps.w.lessThan(0.5), () => { ps.assign(vec4(sv.xyz, 1.0)); });   // init from current heading
+  const f0  = normalize(ps.xyz.add(vec3(0.0, 1e-4, 0.0))).toVar();
+  const rgt = normalize(cross(vec3(0.0, 1.0, 0.0), f0).add(vec3(1e-4, 0.0, 0.0))).toVar();  // +eps: vertical-flight safe
+  const upv = cross(f0, rgt);
+  const TURN = float(2.6);
+  const nf  = normalize(f0.add(rgt.mul(uPilotYaw.mul(TURN).mul(uDt)))
+                          .add(upv.mul(uPilotPitch.mul(TURN).mul(uDt)))).toVar();
+  const spT = clamp(length(ps.xyz).add(uPilotThr.mul(uDt).mul(45.0)), uMinSpeed, uMaxSpeed.mul(1.7)).toVar();
+  const nv  = nf.mul(spT);
+  pilotState.element(int(0)).assign(vec4(nv, 1.0));
+  velBuf.element(sel).assign(vec4(nv, sv.w));
 })().compute(1);
 
 // "Jump to random ship": every live ship draws a random key; atomicMin picks a
@@ -690,6 +710,7 @@ function setPilot(on) {
   if (followIndex < 0) { piloting = false; uPilot.value = 0; return; }
   piloting = on;
   uPilot.value = on ? 1 : 0;
+  if (on) renderer.compute(pilotResetNode);   // re-seed heading from the ship's current velocity
   $('ck_pilot').classList.toggle('on', on);
 }
 
@@ -958,10 +979,22 @@ async function frame(dt) {
   uTime.value += dt;
   uDt.value = state.paused ? 0.0 : Math.min(dt, 1 / 30);
 
+  // Read flight input BEFORE the compute so the GPU always has fresh values.
+  const flying = followIndex >= 0 && !dying;
+  if (flying) {
+    const yaw   = (held.has('a')||held.has('arrowleft')?1:0) - (held.has('d')||held.has('arrowright')?1:0);
+    const pitch = (held.has('s')||held.has('arrowdown')?1:0) - (held.has('w')||held.has('arrowup')?1:0);
+    const thr   = (held.has('shift')?1:0) - (held.has('control')||held.has('x')||held.has(' ')?1:0);
+    if (!piloting && (yaw || pitch || thr)) setPilot(true);   // auto-take control on first key
+    if (piloting) uPilot.value = 1;
+    uPilotYaw.value = yaw; uPilotPitch.value = pitch; uPilotThr.value = thr;
+  }
+
   if (!state.paused) {
     renderer.compute(clearKernel);     // zero grid counts
     renderer.compute(scatterNode);     // bin live agents into the spatial grid
     renderer.compute(boidsNode);       // flock + fight + integrate
+    if (flying && piloting) renderer.compute(pilotStepNode);   // re-assert player heading (AI can't stick)
   }
 
   updateExplosion(dt);              // debris animates regardless of camera mode
@@ -969,13 +1002,6 @@ async function frame(dt) {
     if (dying) {
       updateDeathCam();             // hold + shake on the wreck, then exit
     } else {
-      // flight input (auto-takes control on first key; axes flipped to feel natural)
-      const yaw   = (held.has('a')||held.has('arrowleft')?1:0) - (held.has('d')||held.has('arrowright')?1:0);
-      const pitch = (held.has('s')||held.has('arrowdown')?1:0) - (held.has('w')||held.has('arrowup')?1:0);
-      const thr   = (held.has('shift')?1:0) - (held.has('control')||held.has('x')||held.has(' ')?1:0);
-      if (!piloting && (yaw || pitch || thr)) setPilot(true);
-      if (piloting) uPilot.value = 1;   // insurance: manual control never silently reverts
-      uPilotYaw.value = yaw; uPilotPitch.value = pitch; uPilotThr.value = thr;
       renderer.compute(followNode); // copy the ridden ship's state into followBuf
       readFollow();                 // tiny 64-byte readback (pending-guarded)
       if (lookActive) updateLookCamera();  // free orbit around the ship (drag / scroll)
@@ -1012,8 +1038,18 @@ renderer.setAnimationLoop(animate);
 // manually when the tab is backgrounded and rAF is throttled to zero.
 window.__swarm = {
   frame, reseed, readCounts, state, renderer,
+  randomShip, enterFollow, setPilot, exitFollow,
+  uSelected, uPilot, uPilotYaw, uPilotPitch, uPilotThr,
+  pilotState, followBuf, pilotStepNode,
+  async readPilot() { const a = new Float32Array(await renderer.getArrayBufferAsync(pilotState.value)); return [...a]; },
+  async readFollowBuf() { const a = new Float32Array(await renderer.getArrayBufferAsync(followBuf.value)); return [...a].map(x=>+x.toFixed(2)); },
   get gpuMs() { return gpuMs; },
   get alive() { return [aliveA, aliveB]; },
+  get followIndex() { return followIndex; },
+  get piloting() { return piloting; },
+  get followHealth() { return followHealth; },
+  get followVel() { return followVel.toArray(); },
+  get followPos() { return followPos.toArray(); },
 };
 
 function updateHUD() {
