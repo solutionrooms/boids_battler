@@ -110,7 +110,7 @@
     <div class="sld"><label>max speed</label><input id="r_spd" type="range" min="6" max="34" step="1" value="20"><span class="val" id="v_spd"></span></div>
 
     <div class="grp-label">SCALE</div>
-    <div class="sld"><label>agents</label><input id="r_n" type="range" min="0" max="1000" step="1" value="500"><span class="val" id="v_n"></span></div>
+    <div class="sld"><label>agents</label><input id="r_n" type="range" min="0" max="1000" step="1" value="0"><span class="val" id="v_n"></span></div>
 
     <div class="btns">
       <button id="b_pause">❚❚</button>
@@ -121,7 +121,7 @@
       <button id="b_bloom" class="on">BLOOM</button>
       <button id="b_orbit" class="on">ORBIT</button>
     </div>
-    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> (or <b style="color:var(--gpu)">R</b>) to ride · in cockpit: <b>WASD</b>/arrows to fly (Shift boost), drag to look, <b>Esc</b> to back out. all 2M agents flock &amp; fight on the GPU.</div>
+    <div class="hint">drag rotate · scroll zoom · <b style="color:var(--gpu)">click a ship</b> (or <b style="color:var(--gpu)">R</b>) to ride · in cockpit: <b>WASD</b>/arrows to fly (Shift boost), <b style="color:var(--gpu)">F</b> to fire, drag to look, <b>Esc</b> to back out. all 2M agents flock &amp; fight on the GPU.</div>
   </div>
 
   <div id="crosshair"></div>
@@ -169,6 +169,10 @@ const CELL       = (2 * WORLD_HALF) / GRIDN;   // 6.0 — must be >= max percept
 const NUMCELLS   = GRIDN * GRIDN * GRIDN;      // ~593k cells
 const CAP        = 32;              // max agents stored per grid cell
 const SHIP_LEN   = 1.9;             // ship size
+const POOL       = 2048;            // projectile capacity (ring buffer)
+const PROJ_SPEED = 130.0;           // bolt speed
+const PROJ_LIFE  = 1.5;             // bolt lifetime (s)
+const PROJ_HITR2 = 3.2 * 3.2;       // bolt hit radius squared
 // The arena (spawn extents + boundary) scales with the live agent count so the
 // crowding stays roughly constant from 5k to 2M — see applyScale(). That keeps
 // the grid's per-cell occupancy bounded instead of overflowing at high counts.
@@ -229,6 +233,11 @@ const followBuf  = instancedArray(4, 'vec4');
 //  never writes this, so the pilot heading can't be hijacked by a stray AI step.
 const pilotState = instancedArray(1, 'vec4');
 
+//  Player projectiles. projPos: xyz = position, w = time-to-live (<=0 dead).
+//  projVel: xyz = velocity, w = faction (only hits the opposing faction).
+const projPos = instancedArray(POOL, 'vec4');
+const projVel = instancedArray(POOL, 'vec4');
+
 // ---------------------------------------------------------------------------
 //  UNIFORMS  (driven by the sliders / clock)
 // ---------------------------------------------------------------------------
@@ -260,6 +269,10 @@ const uPilot     = uniform(0.0);                 // 1 = player flies the ridden 
 const uPilotYaw  = uniform(0.0);                 // steering input (-1..1)
 const uPilotPitch= uniform(0.0);
 const uPilotThr  = uniform(0.0);                 // throttle input (-1 brake .. +1 boost)
+const uFireSlot  = uniform(0.0);                 // ring slot to spawn the next bolt into
+const uFirePos   = uniform(new THREE.Vector3()); // muzzle position
+const uFireDir   = uniform(new THREE.Vector3(0, 0, 1));
+const uFireFac   = uniform(0.0);                 // firing ship's faction
 let followIndex = -1;                            // >=0 while riding a ship's cockpit
 
 // ---------------------------------------------------------------------------
@@ -511,6 +524,58 @@ const pilotStepNode = Fn(() => {
   velBuf.element(sel).assign(vec4(nv, sv.w));
 })().compute(1);
 
+// Spawn one bolt into the ring slot, reading the ridden ship's position/heading
+// straight from the GPU buffers (no CPU readback needed to fire).
+const fireNode = Fn(() => {
+  const sel = int(max(uSelected, 0.0));
+  const sp  = posBuf.element(sel);
+  const sv  = velBuf.element(sel);
+  const dir = normalize(sv.xyz.add(vec3(0.0, 0.0, 1e-4)));
+  const s   = int(uFireSlot);
+  projPos.element(s).assign(vec4(sp.xyz.add(dir.mul(2.5)), PROJ_LIFE));
+  projVel.element(s).assign(vec4(dir.mul(PROJ_SPEED), sv.w));   // sv.w = firing ship's faction
+})().compute(1);
+
+// Advance every live bolt; grid-test against agents and vaporise the first
+// enemy hit (consuming the bolt). Reuses the per-frame agent spatial grid.
+const projStepNode = Fn(() => {
+  const P = projPos.element(instanceIndex).toVar();
+  If(P.w.greaterThan(0.0), () => {
+    const V   = projVel.element(instanceIndex);
+    const fac = V.w;
+    const newPos = P.xyz.add(V.xyz.mul(uDt)).toVar();
+    const ttl = P.w.sub(uDt).toVar();
+    const hit = float(0.0).toVar();
+    const gc = cellOf(newPos);
+    Loop({ start: int(-1), end: int(2) }, ({ i: dx }) => {
+      Loop({ start: int(-1), end: int(2) }, ({ i: dy }) => {
+        Loop({ start: int(-1), end: int(2) }, ({ i: dz }) => {
+          const cc  = gc.add(ivec3(dx, dy, dz)).max(ivec3(0)).min(ivec3(GRIDN - 1));
+          const cid = cellIdx(cc);
+          const n   = min(atomicLoad(cellCount.element(cid)), int(CAP)).toVar();
+          Loop(n, ({ i: s }) => {
+            If(hit.lessThan(0.5), () => {
+              const j  = cellBucket.element(cid.mul(int(CAP)).add(s)).toVar();
+              const PJ = posBuf.element(j);
+              If(PJ.w.greaterThan(0.5), () => {                          // alive
+                If(abs(velBuf.element(j).w.sub(fac)).greaterThan(0.5), () => {  // enemy faction
+                  const dp = PJ.xyz.sub(newPos);
+                  If(dot(dp, dp).lessThan(PROJ_HITR2), () => {
+                    posBuf.element(j).assign(vec4(PJ.xyz, 0.0));          // vaporise
+                    hit.assign(1.0);
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+    If(hit.greaterThan(0.5), () => { ttl.assign(0.0); });
+    projPos.element(instanceIndex).assign(vec4(newPos, ttl));
+  });
+})().compute(POOL);
+
 // "Jump to random ship": every live ship draws a random key; atomicMin picks a
 // uniformly-ish random live one (winner of the smallest key).
 const randPickNode = Fn(() => {
@@ -567,6 +632,33 @@ const swarm = new THREE.InstancedMesh(shipGeo, shipMat, MAX);
 swarm.frustumCulled = false;
 scene.add(swarm);
 
+// Projectiles: stretched glowing tracers oriented along their velocity.
+const boltGeo = new THREE.BoxGeometry(0.4, 0.4, 4.5);   // points +Z; oriented to velocity below
+const boltMat = new THREE.MeshBasicNodeMaterial();
+boltMat.toneMapped = false;
+boltMat.transparent = true;
+boltMat.blending = THREE.AdditiveBlending;   // glowing energy bolt, not a solid box
+boltMat.depthWrite = false;
+boltMat.positionNode = Fn(() => {
+  const P = projPos.element(instanceIndex);
+  const V = projVel.element(instanceIndex);
+  const local = positionGeometry;
+  const aliveF = step(0.001, P.w);                       // ttl>0
+  const fwd   = normalize(V.xyz.add(vec3(0.0, 0.0, 1e-4)));
+  const upRef = mix(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), step(0.99, abs(fwd.y)));
+  const right = normalize(cross(upRef, fwd));
+  const up    = cross(fwd, right);
+  const oriented = right.mul(local.x).add(up.mul(local.y)).add(fwd.mul(local.z));  // local +Z -> velocity
+  return P.xyz.add(oriented.mul(aliveF));
+})();
+boltMat.colorNode = Fn(() => {
+  const fac = projVel.element(instanceIndex).w;
+  return mix(vec3(1.7, 3.4, 3.9), vec3(4.0, 1.9, 0.7), fac);   // HDR cyan / amber bolts (bloom-bright)
+})();
+const bolts = new THREE.InstancedMesh(boltGeo, boltMat, POOL);
+bolts.frustumCulled = false;
+scene.add(bolts);
+
 // Starfield backdrop
 (function addStars() {
   const N = 2200, g = new THREE.BufferGeometry(), arr = new Float32Array(N * 3);
@@ -622,12 +714,13 @@ bindSlider('r_per', 'v_per', null, x => x.toFixed(1), x => {
 bindSlider('r_seek', 'v_seek', uWSeek, x => x.toFixed(2));
 bindSlider('r_dmg', 'v_dmg', uDmg, x => x.toFixed(0));
 bindSlider('r_spd', 'v_spd', uMaxSpeed, x => x.toFixed(0));
-// agents: logarithmic track, t=0..1000 → 5k..2M (exactly 100k at the midpoint t=500)
+// agents: logarithmic track, t=0..1000 → 500 .. 2M
 const T_TO_N = (t) => {
-  const n = 5000 * Math.pow(400, t / 1000);
-  return Math.min(MAX, Math.max(5000, Math.round(n / 5000) * 5000));
+  const n = 500 * Math.pow(4000, t / 1000);
+  const r = n < 2000 ? Math.round(n / 100) * 100 : n < 20000 ? Math.round(n / 500) * 500 : Math.round(n / 5000) * 5000;
+  return Math.min(MAX, Math.max(500, r));
 };
-const fmtCount = (n) => n >= 1e6 ? (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M' : (n / 1000) + 'k';
+const fmtCount = (n) => n >= 1e6 ? (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'M' : n >= 1000 ? (n / 1000) + 'k' : '' + n;
 {
   const el = $('r_n'), vl = $('v_n');
   const preview = () => { vl.textContent = fmtCount(T_TO_N(parseFloat(el.value))); };
@@ -705,6 +798,8 @@ let dragging = false, downX = 0, downY = 0, downT = 0, lastX = 0, lastY = 0;
 let lookYaw = 0, lookPitch = 0.2, lookDist = 7;
 let piloting = false;
 const held = new Set();   // keys currently down (for flight input)
+let lastFire = 0, ringIndex = 0;   // projectile fire-rate limiter + ring slot
+const FIRE_MS = 90;
 
 function setPilot(on) {
   if (followIndex < 0) { piloting = false; uPilot.value = 0; return; }
@@ -912,7 +1007,7 @@ function updateDeathCam() {
 $('ck_exit').addEventListener('click', exitFollow);
 $('ck_look').addEventListener('click', () => setLook(!lookActive));
 $('ck_pilot').addEventListener('click', () => setPilot(!piloting));
-const FLY_KEYS = new Set(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','shift','control','x',' ']);
+const FLY_KEYS = new Set(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright','shift','control','x',' ','f']);
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if (k === 'escape') { if (followIndex < 0) return; lookActive ? setLook(false) : exitFollow(); return; }
@@ -988,6 +1083,15 @@ async function frame(dt) {
     if (!piloting && (yaw || pitch || thr)) setPilot(true);   // auto-take control on first key
     if (piloting) uPilot.value = 1;
     uPilotYaw.value = yaw; uPilotPitch.value = pitch; uPilotThr.value = thr;
+
+    // Fire (F): spawn a bolt (fireNode reads the ship's pose from the GPU).
+    const nowMs = performance.now();
+    if (held.has('f') && nowMs - lastFire > FIRE_MS) {
+      lastFire = nowMs;
+      uFireSlot.value = ringIndex;
+      renderer.compute(fireNode);
+      ringIndex = (ringIndex + 1) % POOL;
+    }
   }
 
   if (!state.paused) {
@@ -995,6 +1099,7 @@ async function frame(dt) {
     renderer.compute(scatterNode);     // bin live agents into the spatial grid
     renderer.compute(boidsNode);       // flock + fight + integrate
     if (flying && piloting) renderer.compute(pilotStepNode);   // re-assert player heading (AI can't stick)
+    renderer.compute(projStepNode);    // advance bolts + resolve hits
   }
 
   updateExplosion(dt);              // debris animates regardless of camera mode
@@ -1040,8 +1145,9 @@ window.__swarm = {
   frame, reseed, readCounts, state, renderer,
   randomShip, enterFollow, setPilot, exitFollow,
   uSelected, uPilot, uPilotYaw, uPilotPitch, uPilotThr,
-  pilotState, followBuf, pilotStepNode,
+  pilotState, followBuf, pilotStepNode, projPos,
   async readPilot() { const a = new Float32Array(await renderer.getArrayBufferAsync(pilotState.value)); return [...a]; },
+  async readProjAlive() { const a = new Float32Array(await renderer.getArrayBufferAsync(projPos.value)); let c = 0; for (let i = 0; i < a.length; i += 4) if (a[i + 3] > 0) c++; return c; },
   async readFollowBuf() { const a = new Float32Array(await renderer.getArrayBufferAsync(followBuf.value)); return [...a].map(x=>+x.toFixed(2)); },
   get gpuMs() { return gpuMs; },
   get alive() { return [aliveA, aliveB]; },
